@@ -1,0 +1,11 @@
+{
+  "name": "resume-claude-sessions-bridge",
+  "displayName": "Resume Claude Sessions Bridge",
+  "publisher": "penghaotian-local",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "scripts": { "test": "node --test test/*.test.js" }
+}
