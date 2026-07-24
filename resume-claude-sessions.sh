@@ -482,12 +482,131 @@ launch_seq() {
   done
 }
 
-# --- VSCode: run directly in the integrated terminal ------------------------
-# No `code` CLI can open+inject integrated terminals, and writing tasks.json
-# forces a manual second step — so we execute right here instead. Sequentially,
-# in this terminal: each session runs, and exiting it moves on to the next.
-# (No tmux.)
-launch_vscode() { launch_seq; }
+# --- VSCode: exact-window bridge first, fixed-new-window as the only fallback
+# Two independent paths, tried in order:
+#
+#   1. launch_vscode_bridge — talks to the exact-window Comate bridge server
+#      (bridge/comate_bridge_client.py) over its per-window Unix socket, so
+#      terminals land in the CURRENT window/tabs with no reload and no new
+#      window at all. This is the preferred path whenever the bridge is
+#      actually running in this window.
+#
+#   2. launch_vscode_new_window — the pre-existing .code-workspace mechanism:
+#      VSCode exposes no CLI to spawn/inject terminals in the current window
+#      (checked: comate/code only do -n/-r/-a/-g), so parallel auto-launch
+#      falls back to tasks with runOn:folderOpen in a brand NEW window opened
+#      with a fixed `-n`. Constraints preserved:
+#        a. Each session is its OWN independent terminal — NO
+#           presentation.group, so they are separate terminals, never
+#           split/child panes.
+#        b. The opened window is ROOTED at the work folder (default:
+#           penghaotian), via a self-contained *.code-workspace written in
+#           THIS repo (overwritten each run); penghaotian/.vscode is never
+#           touched.
+#        c. Always `-n`. NEVER `-r`/reuse/reload the user's current window:
+#           doing so would discard its integrated terminals and other
+#           window-local state.
+#
+# launch_vscode() dispatches on launch_vscode_bridge's documented exit code
+# rather than a bare `||`, because falling back after status 3/4 could
+# duplicate terminals the bridge may already have created:
+#   0        bridge completed successfully -> done, no fallback.
+#   2        bridge unavailable BEFORE any bytes were sent -> safe to fall
+#            back to the fixed new window.
+#   3 or 4   request may have been delivered, or the bridge reported
+#            terminal-creation errors -> never retry, never fall back.
+#   other    unexpected internal error -> do not fall back either.
+#
+#   RESUME_VSCODE_FOLDER   window root folder for the new-window fallback
+#                          (default: penghaotian if it exists, else current dir)
+vscode_cli() {   # echo a usable VSCode/comate CLI path, or empty
+  local srv c
+  if [ -n "${VSCODE_GIT_ASKPASS_NODE:-}" ]; then
+    srv="$(dirname "$VSCODE_GIT_ASKPASS_NODE")"
+    for c in "$srv"/bin/remote-cli/*; do [ -x "$c" ] && { echo "$c"; return; }; done
+  fi
+  for c in comate code code-insiders; do command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return; }; done
+}
+
+# --- bridge path: deliver terminals into the CURRENT window, no new window ---
+launch_vscode_bridge() {
+  local client="$SCRIPT_DIR/bridge/comate_bridge_client.py" ipc="${VSCODE_IPC_HOOK_CLI:-}"
+  [ -n "$ipc" ] && [ -f "$client" ] || return 2
+  python3 "$client" probe --ipc-hook "$ipc" >/dev/null 2>&1 || return 2
+
+  local i dangerous=0
+  [ "${RESUME_SKIP_PERMISSIONS:-0}" = "1" ] && dangerous=1
+  {
+    for i in "${chosen_idx[@]}"; do
+      printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+        resume "resume: ${sel_name[$i]} [${sel_time[$i]}]" "${sel_cwd[$i]}" \
+        "$CLAUDE_CMD" "${sel_id[$i]}" "$dangerous"
+      if [ "${sel_cli[$i]}" = "1" ]; then
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+          cli "cli: ${sel_name[$i]}" "${sel_cwd[$i]}" "${SHELL:-/bin/bash}" '' 0
+      fi
+    done
+  } | python3 "$client" send-input0 --ipc-hook "$ipc"
+}
+
+# --- fallback path: fixed -n, new window, no reuse/reload -------------------
+launch_vscode_new_window() {
+  local deffolder="/root/paddlejob/workspace/env_run/penghaotian"
+  [ -d "$deffolder" ] || deffolder="$PWD"
+  local folder="${RESUME_VSCODE_FOLDER:-$deffolder}"
+  local wsfile="$SCRIPT_DIR/resume-sessions.code-workspace"
+  local i label cmd json="" cli
+
+  add_task() { # $1 label  $2 shell-cmd
+    local l="$1" c="$2"
+    l="${l//\"/\'}"; c="${c//\\/\\\\}"; c="${c//\"/\\\"}"
+    [ -n "$json" ] && json+=","
+    # No "group": each task gets its own dedicated top-level terminal.
+    json+='
+      { "label": "'"$l"'", "type": "shell", "command": "'"$c"'",
+        "presentation": { "panel": "dedicated", "reveal": "always", "focus": false },
+        "runOptions": { "runOn": "folderOpen" },
+        "problemMatcher": [] }'
+  }
+  for i in "${chosen_idx[@]}"; do
+    label="resume: ${sel_name[$i]} [${sel_time[$i]}]"
+    cmd="cd '${sel_cwd[$i]//\'/\'\\\'\'}' && $(resume_cmd "$i")"
+    add_task "$label" "$cmd"
+    [ "${sel_cli[$i]}" = "1" ] && add_task "cli: ${sel_name[$i]}" "cd '${sel_cwd[$i]//\'/\'\\\'\'}' && exec \$SHELL"
+  done
+
+  # Overwrite each run. Window root = $folder; tasks live inline in the workspace
+  # file, so nothing is written under $folder/.vscode.
+  cat > "$wsfile" <<EOF
+{
+  "folders": [ { "path": "${folder//\"/\\\"}" } ],
+  "settings": { "task.allowAutomaticTasks": "on" },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [$json
+    ]
+  }
+}
+EOF
+  echo "已写入 $wsfile （窗口根目录=$folder，${#chosen_idx[@]} 个独立终端，folderOpen 自动并行启动）。"
+  cli="$(vscode_cli)"
+  if [ -n "$cli" ]; then
+    echo "新开独立窗口并自动拉起会话：$cli -n $wsfile"
+    "$cli" -n "$wsfile" >/dev/null 2>&1 || echo "（打开失败，请手动在 VSCode 新窗口打开该 .code-workspace 文件）"
+  else
+    echo "未找到 VSCode/comate CLI。请手动在 VSCode 打开：$wsfile"
+  fi
+}
+
+launch_vscode() {
+  launch_vscode_bridge; local status=$?
+  case "$status" in
+    0) return 0 ;;
+    2) launch_vscode_new_window ;;
+    3|4) echo "bridge 请求可能已送达或已报告终端创建错误（退出码 $status），为避免重复终端不会新开窗口。" >&2; return "$status" ;;
+    *) echo "bridge 客户端内部错误（退出码 $status），未启动备用窗口以避免重复终端。" >&2; return "$status" ;;
+  esac
+}
 
 if [ "${RESUME_DRY_RUN:-}" = "1" ]; then
   echo "[dry-run] launch=$LAUNCH_MODE  选中 ${#chosen_idx[@]} 个，组:$chosen_groups"
