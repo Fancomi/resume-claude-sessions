@@ -419,6 +419,80 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
 
+    def test_socket_override_rejected_without_test_mode(self):
+        # --socket alone (no --test-mode) must be refused before any bridge
+        # I/O is attempted, regardless of whether the path is otherwise valid.
+        fields = ["cli", "cli: shell", "/tmp", "/bin/bash", "", "0"]
+        result = self._run(
+            [
+                "send-input0",
+                "--ipc-hook",
+                "/tmp/vscode-ipc-cli-missing.sock",
+                "--timeout",
+                "0.05",
+                "--socket",
+                "/tmp/resume-claude-sessions-0/bridge-doesnotexist.sock",
+            ],
+            input_bytes=("\0".join(fields) + "\0").encode(),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"--test-mode", result.stderr)
+
+    def test_socket_override_rejected_outside_private_runtime_dir(self):
+        # Even with --test-mode, a --socket path outside the private
+        # per-user runtime directory must be rejected.
+        fields = ["cli", "cli: shell", "/tmp", "/bin/bash", "", "0"]
+        result = self._run(
+            [
+                "send-input0",
+                "--ipc-hook",
+                "/tmp/vscode-ipc-cli-missing.sock",
+                "--timeout",
+                "0.05",
+                "--test-mode",
+                "--socket",
+                "/tmp/not-the-runtime-dir/evil.sock",
+            ],
+            input_bytes=("\0".join(fields) + "\0").encode(),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"private runtime directory", result.stderr)
+
+    def test_socket_override_accepted_inside_private_runtime_dir_with_test_mode(self):
+        # A --socket path beneath the private runtime dir, combined with
+        # --test-mode, is allowed through to send_request (which will then
+        # fail with BridgeUnavailable/2 because nothing is listening — this
+        # test only proves the gating logic itself does not reject it).
+        with tempfile.TemporaryDirectory() as tmp:
+            uid = os.getuid()
+            fake_runtime_dir = Path(tmp) / f"resume-claude-sessions-{uid}"
+            fake_runtime_dir.mkdir()
+            fake_socket = fake_runtime_dir / "bridge-test.sock"
+            fields = ["cli", "cli: shell", "/tmp", "/bin/bash", "", "0"]
+            env = dict(os.environ)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bridge.comate_bridge_client",
+                    "send-input0",
+                    "--ipc-hook",
+                    "irrelevant-in-test-mode",
+                    "--timeout",
+                    "0.05",
+                    "--test-mode",
+                    "--socket",
+                    str(fake_socket),
+                ],
+                input=("\0".join(fields) + "\0").encode(),
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                env={**env, "TMPDIR": tmp},
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn(b"--test-mode", result.stderr)
+            self.assertNotIn(b"private runtime directory", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

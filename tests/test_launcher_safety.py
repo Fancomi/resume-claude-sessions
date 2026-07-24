@@ -66,6 +66,38 @@ class LauncherSafetyTests(unittest.TestCase):
             self.assertIn(code, body)
 
 
+class IntegrationTestScriptSafetyTests(unittest.TestCase):
+    """Source-level checks for scripts/test-comate-bridge-window.sh.
+
+    No subprocess execution here: this only inspects the script's text to
+    confirm it opens exactly one new window with `comate -n`, records and
+    excludes the pre-existing socket identity before probing for a new one,
+    and never reuses/reloads/closes any window.
+    """
+
+    def setUp(self):
+        self.source = (SOURCE_PATH.parent / "scripts/test-comate-bridge-window.sh").read_text()
+
+    def test_integration_test_opens_new_window_and_excludes_original_identity(self):
+        source = self.source
+        self.assertIn('"$COMATE_CLI" -n "$TEST_DIR"', source)
+        self.assertIn("ORIGINAL_IDENTITY=", source)
+        self.assertIn('if [ "$candidate" = "$ORIGINAL_SOCKET" ]; then continue; fi', source)
+        for forbidden in [" --reuse-window ", " -r ", "reloadWindow"]:
+            self.assertNotIn(forbidden, source)
+
+    def test_requires_explicit_guard_flag(self):
+        self.assertIn("--i-understand-this-opens-a-new-test-window", self.source)
+
+    def test_never_closes_a_window(self):
+        for forbidden in [".dispose(", "workbench.action.closeWindow", "workbench.action.closeFolder", "kill "]:
+            self.assertNotIn(forbidden, self.source)
+
+    def test_socket_override_requires_test_mode_and_private_runtime_dir(self):
+        self.assertIn("--test-mode", self.source)
+        self.assertIn('--socket "$TEST_SOCKET"', self.source)
+
+
 FAKE_BRIDGE_CLIENT_TEMPLATE = textwrap.dedent(
     """\
     #!/usr/bin/env python3

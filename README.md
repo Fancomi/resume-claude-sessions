@@ -52,6 +52,57 @@ sudo apt install python3-tk    # 或安装 zenity
 powershell -ExecutionPolicy Bypass -File resume-claude-sessions.ps1
 ```
 
+## Comate 终端桥接（VSCode / Comate 远程）
+
+在 Comate/VSCode 远程会话里，`resume-claude-sessions.sh` 会优先尝试通过一个
+per-window 的本地 Unix socket 直接把要恢复的会话作为「集成终端」追加到**当前
+调用它的这个窗口**里，不新开窗口、不 reload、不复用（`-r`）。只有桥接不可用
+时才回退到固定用 `-n` 打开一个新窗口。
+
+安装桥接扩展（不会 reload 任何窗口）：
+
+```bash
+./scripts/install-comate-bridge.sh
+# No window is reloaded. Restart Comate naturally when convenient.
+
+bash resume-claude-sessions.sh
+```
+
+行为总结：
+
+- **桥接可用**：把每个选中的会话作为独立终端追加到当前调用窗口，当前窗口
+  已有的终端、编辑器、其它窗口状态**一律不会被修改**。
+- **桥接不可用**（扩展未安装/未激活/`VSCODE_IPC_HOOK_CLI` 缺失等）：回退到
+  固定 `-n` 打开一个新窗口，根目录为 `penghaotian`（或 `RESUME_VSCODE_FOLDER`
+  指定的目录），任务通过 `runOn: folderOpen` 自动并行启动；**绝不**使用
+  `-r`/`--reuse-window`/reload 当前窗口。
+- 无论走哪条路径，**已存在的终端永远不会被读取、复用或关闭**——桥接只调用
+  `vscode.window.createTerminal(...)` 新建终端，回退路径只写一个全新覆盖的
+  `.code-workspace` 文件。
+- `RESUME_SKIP_PERMISSIONS=1` 仍然是**显式 opt-in**：默认恢复会话时永远不带
+  `--dangerously-skip-permissions`，只有显式设置该环境变量为 `1` 时才会加上。
+- 生成的 `resume-sessions.code-workspace` 文件**每次运行都会被整体覆盖**，
+  内容只包含窗口根目录和任务命令（会话 cwd、`claude --resume <id>` 命令），
+  **不包含任何密钥**；已加入 `.gitignore`，不会被提交。
+
+### 隔离集成测试
+
+`scripts/test-comate-bridge-window.sh` 用于手工验证桥接在**全新窗口**里确实
+可用，绝不会碰当前调用它的窗口：它记录并排除当前窗口的 socket 身份，只用
+`comate -n <临时目录>` 打开一个新窗口，等待恰好一个新的桥接 socket 出现后
+发送一次测试请求（两个独立终端），然后让新窗口保持打开供人工检查——**该脚本
+不会自动关闭任何窗口**。
+
+必须带上明确的确认标志才会运行：
+
+```bash
+./scripts/test-comate-bridge-window.sh --i-understand-this-opens-a-new-test-window
+```
+
+该脚本内部使用的显式 `--socket` 覆盖（配合 `--test-mode`，且路径必须位于当前
+用户的私有运行时目录下）仅供这个隔离测试脚本使用，正常的
+`resume-claude-sessions.sh` 启动流程永远不会暴露或使用这个覆盖参数。
+
 ## 环境变量（测试 / 覆盖）
 
 | 变量 | 作用 |

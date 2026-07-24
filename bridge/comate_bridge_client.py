@@ -362,8 +362,35 @@ def _cli_send_input0(args: argparse.Namespace) -> int:
         print("no terminals requested", file=sys.stderr)
         return EXIT_UNAVAILABLE
 
+    # ``--socket`` is a private, test-only override: it is only accepted at
+    # all when ``--test-mode`` is also passed, and even then only when it
+    # points beneath this user's own private runtime directory (the same
+    # ``resume-claude-sessions-<uid>`` directory ``socket_paths`` derives).
+    # This lets the guarded integration test in
+    # ``scripts/test-comate-bridge-window.sh`` target a freshly opened test
+    # window's bridge socket explicitly (since that window's IPC hook is not
+    # known to this process ahead of time), without giving normal launcher
+    # invocations of ``send-input0`` any way to address an arbitrary socket.
+    socket_override: str | None = None
+    if getattr(args, "socket", None):
+        if not getattr(args, "test_mode", False):
+            print("--socket requires --test-mode", file=sys.stderr)
+            return EXIT_UNAVAILABLE
+        runtime_dir = socket_paths(args.ipc_hook or "test-mode-placeholder").runtime_dir
+        candidate = os.path.realpath(args.socket)
+        allowed_root = os.path.realpath(runtime_dir)
+        if os.path.commonpath([candidate, allowed_root]) != allowed_root:
+            print(
+                f"--socket must be beneath the private runtime directory {allowed_root}",
+                file=sys.stderr,
+            )
+            return EXIT_UNAVAILABLE
+        socket_override = args.socket
+
     try:
-        response = send_request(args.ipc_hook, terminals, timeout=args.timeout)
+        response = send_request(
+            args.ipc_hook, terminals, timeout=args.timeout, _socket_path=socket_override
+        )
     except BridgeUnavailable as error:
         print(f"bridge unavailable: {error}", file=sys.stderr)
         return EXIT_UNAVAILABLE
@@ -393,6 +420,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     send_parser.add_argument("--ipc-hook", required=True)
     send_parser.add_argument("--timeout", type=float, default=DEFAULT_SEND_TIMEOUT)
+    send_parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="required alongside --socket; never set by the normal launcher",
+    )
+    send_parser.add_argument(
+        "--socket",
+        default=None,
+        help=(
+            "test-only explicit socket path override, beneath the private runtime "
+            "directory; requires --test-mode and is rejected otherwise"
+        ),
+    )
     send_parser.set_defaults(handler=_cli_send_input0)
 
     args = parser.parse_args(argv)
