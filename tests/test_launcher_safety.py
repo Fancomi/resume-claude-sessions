@@ -97,6 +97,36 @@ class IntegrationTestScriptSafetyTests(unittest.TestCase):
         self.assertIn("--test-mode", self.source)
         self.assertIn('--socket "$TEST_SOCKET"', self.source)
 
+    def test_both_terminal_scripts_present(self):
+        # First terminal writes VSCODE_IPC_HOOK_CLI to terminal-ipc.txt, then
+        # execs bash. Second terminal prints the fixed marker line, then
+        # execs bash. Both must use the test-only "test" kind (gated by
+        # --test-mode on the client side), not the plain "cli" kind, so that
+        # each can run its own script before dropping into an interactive
+        # shell.
+        self.assertIn('$VSCODE_IPC_HOOK_CLI', self.source)
+        self.assertIn("terminal-ipc.txt", self.source)
+        self.assertIn("exec bash", self.source)
+        self.assertIn("bridge second terminal ready", self.source)
+        self.assertIn('test "bridge-test-identity"', self.source)
+        self.assertIn('test "bridge-test-second"', self.source)
+
+    def test_automatic_ipc_hash_comparison_and_mismatch_failure(self):
+        # The script must compute the sha256-based identity of the terminal-
+        # reported IPC itself (not just print instructions for a human to run
+        # it) and compare it against TEST_IDENTITY, exiting non-zero on a
+        # mismatch or timeout while still leaving the window open.
+        self.assertIn("hashlib.sha256", self.source)
+        self.assertIn('REPORTED_IDENTITY" = "$TEST_IDENTITY"', self.source)
+        self.assertIn("VERIFY_STATUS", self.source)
+        self.assertIn('if [ "$VERIFY_STATUS" -ne 0 ]; then\n  exit 1\nfi', self.source)
+
+    def test_ipc_marker_file_poll_is_bounded(self):
+        # The wait for terminal-ipc.txt must be a bounded poll loop, not an
+        # unconditional blocking read.
+        self.assertIn("IPC_POLL_SECONDS", self.source)
+        self.assertIn("ipc_elapsed", self.source)
+
 
 FAKE_BRIDGE_CLIENT_TEMPLATE = textwrap.dedent(
     """\

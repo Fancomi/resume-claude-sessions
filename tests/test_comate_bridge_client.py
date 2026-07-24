@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -74,6 +75,45 @@ class ClientTests(unittest.TestCase):
         record = "\0".join(["cli", "name", "/tmp", "claude", "", "0"]) + "\0"
         terminals = build_terminals((record * 100).encode())
         self.assertEqual(len(terminals), 100)
+
+    def test_test_kind_rejected_by_default(self):
+        # "test" records must be rejected unless the caller explicitly opts
+        # in with allow_test=True; normal (non-test) callers never do this.
+        fields = ["test", "bridge-test-identity", "/tmp", "/bin/sh", "echo hi", "0"]
+        with self.assertRaisesRegex(ValueError, "test mode"):
+            build_terminals("\0".join(fields).encode() + b"\0")
+
+    def test_test_kind_accepted_with_allow_test(self):
+        fields = ["test", "bridge-test-identity", "/tmp", "/bin/sh", "echo hi", "0"]
+        terminals = build_terminals("\0".join(fields).encode() + b"\0", allow_test=True)
+        self.assertEqual(terminals[0]["command"], "/bin/sh -lc 'echo hi'")
+        self.assertEqual(terminals[0]["name"], "bridge-test-identity")
+        self.assertEqual(terminals[0]["cwd"], "/tmp")
+
+    def test_test_kind_requires_a_script(self):
+        fields = ["test", "bridge-test-identity", "/tmp", "/bin/sh", "", "0"]
+        with self.assertRaisesRegex(ValueError, "requires a script"):
+            build_terminals("\0".join(fields).encode() + b"\0", allow_test=True)
+
+    def test_test_kind_quoting_is_safe_with_shell_metacharacters(self):
+        # The script field may itself contain quotes/semicolons/redirects;
+        # shlex.join must produce a single safely-quoted argument so the
+        # resulting argv is [executable, "-lc", script] verbatim, never
+        # allowing the script's content to be split into extra argv entries
+        # or to escape its single argument boundary.
+        script = "printf '%s' \"$VSCODE_IPC_HOOK_CLI\" > /tmp/x; rm -rf /not-really; exec bash"
+        fields = ["test", "bridge-test-identity", "/tmp", "/bin/sh", script, "0"]
+        terminals = build_terminals("\0".join(fields).encode() + b"\0", allow_test=True)
+        # Round-trip through shlex.split must reproduce exactly [executable, "-lc", script].
+        parsed = shlex.split(terminals[0]["command"])
+        self.assertEqual(parsed, ["/bin/sh", "-lc", script])
+
+    def test_test_kind_still_rejects_unknown_kind_and_other_validation(self):
+        # allow_test=True must not loosen any other validation (unknown
+        # kinds, empty required fields, record-count cap remain enforced).
+        fields = ["bogus", "name", "/tmp", "claude", "script", "0"]
+        with self.assertRaisesRegex(ValueError, "unknown kind"):
+            build_terminals("\0".join(fields).encode() + b"\0", allow_test=True)
 
 
 class FakeBridgeServer:
@@ -492,6 +532,53 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertNotIn(b"--test-mode", result.stderr)
             self.assertNotIn(b"private runtime directory", result.stderr)
+
+    def test_send_input0_cli_rejects_test_kind_record_in_normal_mode(self):
+        # A "test"-kind record must be rejected by send-input0 when
+        # --test-mode is not passed, before any bridge I/O is attempted.
+        fields = ["test", "bridge-test-identity", "/tmp", "/bin/sh", "echo hi", "0"]
+        result = self._run(
+            ["send-input0", "--ipc-hook", "/tmp/vscode-ipc-cli-missing.sock", "--timeout", "0.05"],
+            input_bytes=("\0".join(fields) + "\0").encode(),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"test mode", result.stderr)
+
+    def test_send_input0_cli_accepts_test_kind_record_with_test_mode(self):
+        # With --test-mode (and a --socket beneath the private runtime dir),
+        # a "test"-kind record is parsed successfully; the only failure past
+        # that point is BridgeUnavailable (nothing listening), proving the
+        # kind gate itself does not block valid test-mode input.
+        with tempfile.TemporaryDirectory() as tmp:
+            uid = os.getuid()
+            fake_runtime_dir = Path(tmp) / f"resume-claude-sessions-{uid}"
+            fake_runtime_dir.mkdir()
+            fake_socket = fake_runtime_dir / "bridge-test.sock"
+            fields = ["test", "bridge-test-identity", "/tmp", "/bin/sh", "echo hi", "0"]
+            env = dict(os.environ)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bridge.comate_bridge_client",
+                    "send-input0",
+                    "--ipc-hook",
+                    "irrelevant-in-test-mode",
+                    "--timeout",
+                    "0.05",
+                    "--test-mode",
+                    "--socket",
+                    str(fake_socket),
+                ],
+                input=("\0".join(fields) + "\0").encode(),
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                env={**env, "TMPDIR": tmp},
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"bridge unavailable", result.stderr)
+            self.assertNotIn(b"test mode", result.stderr)
+            self.assertNotIn(b"unknown kind", result.stderr)
 
 
 if __name__ == "__main__":

@@ -113,7 +113,7 @@ def _split_nul_records(data: bytes) -> list[list[str]]:
     ]
 
 
-def build_terminals(data: bytes) -> list[dict]:
+def build_terminals(data: bytes, *, allow_test: bool = False) -> list[dict]:
     """Parse NUL-delimited input0 records into bridge terminal descriptors.
 
     Each record has exactly six fields:
@@ -123,12 +123,26 @@ def build_terminals(data: bytes) -> list[dict]:
         - "resume": command is
           ``shlex.join([executable, "--resume", session_id] + [dangerous_flag?])``
         - "cli": command is ``shlex.join([executable])``
+        - "test": command is ``shlex.join([executable, "-lc", session_id])`` —
+          i.e. the record's session-id field carries an arbitrary shell
+          script to run via ``<executable> -lc <script>``. This kind is
+          rejected with ``ValueError`` unless the caller explicitly passes
+          ``allow_test=True``; normal launcher flow (which never sets
+          ``allow_test``) can never produce a "test" terminal, no matter what
+          bytes it is fed. It exists solely so the guarded isolated
+          integration test (``scripts/test-comate-bridge-window.sh``, via
+          ``send-input0 --test-mode``) can request terminals that run a
+          specific script (e.g. write ``$VSCODE_IPC_HOOK_CLI`` to a file, or
+          print a fixed marker line) before dropping into an interactive
+          shell, without weakening the "resume"/"cli" contract normal
+          invocations rely on.
 
-    Raises ``ValueError`` for unknown kinds, incomplete records, embedded
-    empty name/cwd/executable fields, or more than 100 records. The
-    dangerous ``--dangerously-skip-permissions`` flag is only ever added when
-    field index 5 is exactly the string ``"1"`` — any other value (including
-    "0", empty, or anything else) never enables it.
+    Raises ``ValueError`` for unknown kinds, a "test" record when
+    ``allow_test`` is not set, incomplete records, embedded empty
+    name/cwd/executable fields, or more than 100 records. The dangerous
+    ``--dangerously-skip-permissions`` flag is only ever added when field
+    index 5 is exactly the string ``"1"`` — any other value (including "0",
+    empty, or anything else) never enables it.
     """
     records = _split_nul_records(data)
     if len(records) > MAX_TERMINALS:
@@ -160,6 +174,15 @@ def build_terminals(data: bytes) -> list[dict]:
             command = shlex.join(argv)
         elif kind == "cli":
             command = shlex.join([executable])
+        elif kind == "test":
+            if not allow_test:
+                raise ValueError(
+                    "input0 'test' record is only permitted in test mode "
+                    "(send-input0 --test-mode); rejected by default"
+                )
+            if not session_id:
+                raise ValueError("input0 'test' record requires a script in the session-id field")
+            command = shlex.join([executable, "-lc", session_id])
         else:
             raise ValueError(f"unknown kind in input0 record: {kind!r}")
 
@@ -352,8 +375,11 @@ def _cli_probe(args: argparse.Namespace) -> int:
 
 def _cli_send_input0(args: argparse.Namespace) -> int:
     data = sys.stdin.buffer.read()
+    # "test"-kind terminals (arbitrary script via `<executable> -lc <script>`)
+    # are only ever accepted when --test-mode is set; normal launcher
+    # invocations never pass --test-mode, so they can never enable this.
     try:
-        terminals = build_terminals(data)
+        terminals = build_terminals(data, allow_test=getattr(args, "test_mode", False))
     except ValueError as error:
         print(f"invalid input0 data: {error}", file=sys.stderr)
         return EXIT_UNAVAILABLE

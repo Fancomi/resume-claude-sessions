@@ -158,15 +158,24 @@ TEST_IDENTITY="${TEST_IDENTITY#bridge-}"
 # --- send the test request via the explicit test-only --socket override.
 # This override requires BOTH --test-mode and a socket beneath the private
 # runtime directory; it is never used by the normal launcher flow (which
-# always derives the socket from --ipc-hook only).
+# always derives the socket from --ipc-hook only). Both terminal records use
+# the test-only "test" kind (also gated behind --test-mode on the client
+# side, rejected by default): the first writes its own VSCODE_IPC_HOOK_CLI to
+# a known file then drops into an interactive shell; the second just prints a
+# fixed marker line then drops into an interactive shell. Neither terminal
+# does anything else; both remain harmless, independent, inspectable shells.
+IPC_MARKER_FILE="$TEST_DIR/terminal-ipc.txt"
+IDENTITY_SCRIPT="printf '%s' \"\$VSCODE_IPC_HOOK_CLI\" > $(printf '%q' "$IPC_MARKER_FILE"); exec bash"
+SECOND_SCRIPT="printf 'bridge second terminal ready\n'; exec bash"
+
 echo "发送测试请求到新窗口（两个独立终端）..."
 {
   printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
-    cli "bridge-test-identity" "$TEST_DIR" \
-    "/bin/sh" '' 0
+    test "bridge-test-identity" "$TEST_DIR" \
+    "/bin/sh" "$IDENTITY_SCRIPT" 0
   printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
-    cli "bridge-test-second" "$TEST_DIR" \
-    "/bin/sh" '' 0
+    test "bridge-test-second" "$TEST_DIR" \
+    "/bin/sh" "$SECOND_SCRIPT" 0
 } | python3 "$CLIENT" send-input0 \
   --ipc-hook "test-window-$TEST_IDENTITY" \
   --test-mode \
@@ -179,16 +188,49 @@ if [ "$SEND_STATUS" -ne 0 ]; then
 fi
 
 echo "测试请求已送达；新窗口应已出现两个终端（bridge-test-identity, bridge-test-second）。"
-echo "注意：上面创建的终端运行的是普通 shell（/bin/sh），不会自动打印 IPC hash 文件；"
-echo "如需人工核对 IPC 一致性，请在新窗口的任一终端手动执行："
-echo "  echo \"\$VSCODE_IPC_HOOK_CLI\" | sha256sum | cut -c1-24"
-echo "并确认其输出等于：$TEST_IDENTITY"
+
+# --- bounded poll for the identity terminal's reported IPC hook, then
+# automatically hash it and compare against TEST_IDENTITY (derived from
+# TEST_SOCKET). This never blocks indefinitely and never closes the window
+# on mismatch or timeout -- it only reports the verification outcome.
+IPC_POLL_SECONDS="${BRIDGE_TEST_IPC_POLL_SECONDS:-20}"
+ipc_elapsed=0
+REPORTED_IPC=""
+while [ "$(echo "$ipc_elapsed < $IPC_POLL_SECONDS" | python3 -c 'import sys; a,b=sys.stdin.read().split("<"); print(1 if float(a)<float(b) else 0)')" = "1" ]; do
+  if [ -s "$IPC_MARKER_FILE" ]; then
+    REPORTED_IPC="$(cat "$IPC_MARKER_FILE")"
+    break
+  fi
+  sleep "$POLL_INTERVAL"
+  ipc_elapsed="$(echo "$ipc_elapsed + $POLL_INTERVAL" | python3 -c 'import sys; a,b=sys.stdin.read().split("+"); print(float(a)+float(b))')"
+done
+
+VERIFY_STATUS=1
+if [ -z "$REPORTED_IPC" ]; then
+  echo "在 ${IPC_POLL_SECONDS}s 内未观察到 $IPC_MARKER_FILE 中的终端上报 IPC，自动核对失败（超时）。" >&2
+else
+  REPORTED_IDENTITY="$(python3 -c "
+import hashlib, sys
+print(hashlib.sha256(sys.argv[1].encode('utf-8')).hexdigest()[:24])
+" "$REPORTED_IPC")"
+  if [ "$REPORTED_IDENTITY" = "$TEST_IDENTITY" ]; then
+    echo "自动核对通过：终端上报 IPC 的哈希与 TEST_IDENTITY 一致（$REPORTED_IDENTITY）。"
+    VERIFY_STATUS=0
+  else
+    echo "自动核对失败：终端上报 IPC 的哈希（$REPORTED_IDENTITY）与 TEST_IDENTITY（$TEST_IDENTITY）不一致。" >&2
+  fi
+fi
 
 echo
 echo "验证结果："
 echo "  - 原窗口 socket 被排除：$([ -n "$ORIGINAL_SOCKET" ] && echo "是（$ORIGINAL_SOCKET）" || echo "N/A（当前非 VSCode/Comate 终端）")"
 echo "  - 新窗口 socket（唯一）：$TEST_SOCKET"
 echo "  - 测试请求送达：是（退出码 0）"
+echo "  - IPC 身份自动核对：$([ "$VERIFY_STATUS" -eq 0 ] && echo "通过" || echo "失败")"
 echo
-echo "测试窗口保持打开状态，供人工检查；本脚本不会关闭任何窗口。"
+echo "测试窗口保持打开状态，供人工检查；本脚本不会关闭任何窗口（无论核对结果如何）。"
 echo "临时测试工作区：$TEST_DIR（可手动删除）"
+
+if [ "$VERIFY_STATUS" -ne 0 ]; then
+  exit 1
+fi
