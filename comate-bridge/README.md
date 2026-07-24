@@ -41,3 +41,12 @@ only. It never passes `-r`/`--reuse-window`, `-n`, or triggers any reload
 command. The newly installed extension activates the next time Comate
 starts naturally (e.g. its next window/process restart) — not via any
 forced reload from this installer.
+
+The installer locates a usable CLI the same way the launcher's
+`vscode_cli()` does: if `VSCODE_GIT_ASKPASS_NODE` is set, it looks for an
+executable under that variable's sibling `server/bin/remote-cli` directory
+(preferring an entry literally named `comate`, falling back to whatever
+executable is there otherwise); if that yields nothing, it falls back to a
+plain `PATH` lookup for `comate`, then `code`, then `code-insiders`. This
+matters in remote/container sessions where no CLI is ever on `PATH` and the
+only usable binary is the one derived from `VSCODE_GIT_ASKPASS_NODE`.

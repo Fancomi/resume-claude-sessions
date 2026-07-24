@@ -26,12 +26,49 @@ if [ ! -f "$VSIX" ]; then
   exit 1
 fi
 
-# Same safe lookup style as resume-claude-sessions.sh's vscode_cli() (command -v),
-# restricted to the Comate CLI only (this installer targets Comate exclusively).
-COMATE_CLI="$(command -v comate 2>/dev/null || true)"
+# Same safe discovery order as resume-claude-sessions.sh's vscode_cli(): if
+# VSCODE_GIT_ASKPASS_NODE is set, look for an executable entry (preferring
+# "comate" if present) under its sibling server/bin/remote-cli directory —
+# this is the usable CLI in a remote-container session where no CLI is on
+# PATH at all. Otherwise fall back to a plain PATH lookup for comate, then
+# code, then code-insiders. Only ever used to resolve a path; never invokes
+# -n, -r, reuse, reload, or any workspace command.
+find_comate_cli() {
+  local srv c fallback=""
+  if [ -n "${VSCODE_GIT_ASKPASS_NODE:-}" ]; then
+    srv="$(dirname "$VSCODE_GIT_ASKPASS_NODE")/bin/remote-cli"
+    if [ -d "$srv" ]; then
+      for c in "$srv"/*; do
+        [ -x "$c" ] || continue
+        if [ "$(basename "$c")" = "comate" ]; then
+          echo "$c"
+          return
+        fi
+        [ -z "$fallback" ] && fallback="$c"
+      done
+      if [ -n "$fallback" ]; then
+        echo "$fallback"
+        return
+      fi
+    fi
+  fi
+  for c in comate code code-insiders; do
+    command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return; }
+  done
+}
+
+COMATE_CLI="$(find_comate_cli)"
 if [ -z "$COMATE_CLI" ]; then
   echo "未找到 comate CLI，无法安装扩展。" >&2
   exit 1
+fi
+
+# Test-only escape hatch: print the resolved CLI path and exit before ever
+# invoking it, so installer tests can verify discovery without touching a
+# real Comate/VS Code binary.
+if [ -n "${PROBE_ONLY:-}" ]; then
+  echo "$COMATE_CLI"
+  exit 0
 fi
 
 "$COMATE_CLI" --install-extension "$VSIX" --force
