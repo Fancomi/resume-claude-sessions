@@ -65,6 +65,46 @@ class LauncherSafetyTests(unittest.TestCase):
         for code in ("0)", "2)", "3|4)"):
             self.assertIn(code, body)
 
+    def test_bridge_path_uses_confirmed_pairing_not_ipc_hook(self):
+        # Normal routing must use the confirmed pairing (probe-paired /
+        # send-input0 --paired-workspace), never VSCODE_IPC_HOOK_CLI or
+        # --ipc-hook: an isolated live test proved the IPC hook differs
+        # between terminals in the same window, so it cannot identify "this
+        # window" for routing.
+        idx = self.source.index("launch_vscode_bridge() {")
+        body_end = self.source.index("\n}\n", idx)
+        body = self.source[idx:body_end]
+        self.assertIn("probe-paired", body)
+        self.assertIn("--paired-workspace", body)
+        self.assertNotIn("VSCODE_IPC_HOOK_CLI", body)
+        self.assertNotIn("--ipc-hook", body)
+
+
+class PairScriptSafetyTests(unittest.TestCase):
+    """Source-level checks for scripts/pair-comate-bridge.sh.
+
+    No subprocess execution: this script's only side effect (writing the
+    pair file) is exercised by the Python pairing tests via
+    ``create_pairing`` directly. Here we only confirm the shell wrapper
+    itself has no Comate invocation, no reuse/reload, and gates on the exact
+    confirmation flag.
+    """
+
+    def setUp(self):
+        self.source = (SOURCE_PATH.parent / "scripts/pair-comate-bridge.sh").read_text()
+
+    def test_requires_confirmed_current_window_flag(self):
+        self.assertIn("--confirmed-current-window", self.source)
+
+    def test_never_invokes_comate_or_reuses_reloads(self):
+        for forbidden in ["comate -r", "comate -n", '"$cli" -n', "--reuse-window", "reloadWindow", "createTerminal"]:
+            self.assertNotIn(forbidden, self.source)
+
+    def test_only_calls_the_pair_subcommand(self):
+        self.assertIn("comate_bridge_client.py\" pair", self.source)
+        self.assertNotIn("send-input0", self.source)
+        self.assertNotIn("probe-paired", self.source)
+
 
 class IntegrationTestScriptSafetyTests(unittest.TestCase):
     """Source-level checks for scripts/test-comate-bridge-window.sh.
@@ -143,7 +183,7 @@ FAKE_BRIDGE_CLIENT_TEMPLATE = textwrap.dedent(
         if not argv:
             return 4
         cmd = argv[0]
-        if cmd == "probe":
+        if cmd == "probe-paired":
             return PROBE_EXIT
         if cmd == "send-input0":
             data = sys.stdin.buffer.read()

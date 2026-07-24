@@ -12,9 +12,13 @@ import unittest
 from pathlib import Path
 
 from bridge.comate_bridge_client import (
+    BridgeCandidate,
     BridgeDeliveryUncertain,
     BridgeUnavailable,
     build_terminals,
+    create_pairing,
+    discover_live_candidates,
+    resolve_pairing,
     send_request,
     socket_paths,
 )
@@ -427,6 +431,275 @@ class ProbeTests(unittest.TestCase):
                 probe("/tmp/vscode-ipc-missing.sock", timeout=0.05, uid=os.getuid(), tmpdir=tmpdir)
 
 
+class _PairingFixture(unittest.TestCase):
+    """Shared helpers for building fake live-candidate sockets/metadata on disk.
+
+    None of these tests touch a real Comate/VSCode window, terminal, or
+    socket: every "live candidate" here is a throwaway Unix socket bound in a
+    TemporaryDirectory, with hand-written adjacent metadata, cleaned up by
+    ``addCleanup``/context managers.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tmpdir = self.tmp.name
+        self.uid = os.getuid()
+        self.runtime_dir = os.path.join(self.tmpdir, f"resume-claude-sessions-{self.uid}")
+        os.makedirs(self.runtime_dir, mode=0o700, exist_ok=True)
+        self.workspace = os.path.join(self.tmpdir, "workspace")
+        os.makedirs(self.workspace, exist_ok=True)
+        self._servers = []
+        self.addCleanup(self._close_servers)
+
+    def _close_servers(self):
+        for server in self._servers:
+            try:
+                server.close()
+            except OSError:
+                pass
+
+    def _make_live_socket(self, identity, pid=None, metadata_overrides=None, metadata_mode=0o600):
+        """Bind a real listening Unix socket plus adjacent metadata file.
+
+        Returns the socket path. The listening socket is closed automatically
+        during test teardown.
+        """
+        socket_path = os.path.join(self.runtime_dir, f"bridge-{identity}.sock")
+        metadata_path = os.path.join(self.runtime_dir, f"bridge-{identity}.json")
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(socket_path)
+        server.listen(1)
+        self._servers.append(server)
+
+        metadata = {"version": 1, "pid": pid if pid is not None else os.getpid(), "identity": identity}
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle)
+        os.chmod(metadata_path, metadata_mode)
+        return socket_path
+
+
+class DiscoverLiveCandidatesTests(_PairingFixture):
+    def test_zero_candidates_returns_empty_list(self):
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(candidates, [])
+
+    def test_single_live_candidate_is_discovered(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa")
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].identity, "aaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertIsInstance(candidates[0], BridgeCandidate)
+
+    def test_multiple_live_candidates_all_discovered(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa")
+        self._make_live_socket("bbbbbbbbbbbbbbbbbbbbbbbb")
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(len(candidates), 2)
+
+    def test_identity_filename_mismatch_excluded(self):
+        # Metadata's "identity" field disagrees with the filename-derived one.
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", metadata_overrides={"identity": "wrong-identity"})
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(candidates, [])
+
+    def test_dead_pid_excluded(self):
+        # PID 2**30 is astronomically unlikely to be a live process.
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=2**30)
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(candidates, [])
+
+    def test_nonpositive_pid_excluded(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=-1)
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(candidates, [])
+
+    def test_metadata_not_mode_0600_excluded(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", metadata_mode=0o644)
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(candidates, [])
+
+    def test_metadata_wrong_version_excluded(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", metadata_overrides={"version": 2})
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(candidates, [])
+
+    def test_socket_without_metadata_excluded(self):
+        socket_path = os.path.join(self.runtime_dir, "bridge-cccccccccccccccccccccccc.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(socket_path)
+        server.listen(1)
+        self._servers.append(server)
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir)
+        self.assertEqual(candidates, [])
+
+    def test_socket_that_does_not_accept_connections_excluded(self):
+        # Metadata exists and is well-formed, but the socket file itself is
+        # not a listening socket (simulates a stale/dead socket file).
+        identity = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        socket_path = os.path.join(self.runtime_dir, f"bridge-{identity}.sock")
+        metadata_path = os.path.join(self.runtime_dir, f"bridge-{identity}.json")
+        with open(socket_path, "w", encoding="utf-8") as handle:
+            handle.write("")
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "pid": os.getpid(), "identity": identity}, handle)
+        os.chmod(metadata_path, 0o600)
+        candidates = discover_live_candidates(uid=self.uid, tmpdir=self.tmpdir, timeout=0.1)
+        self.assertEqual(candidates, [])
+
+
+class CreatePairingTests(_PairingFixture):
+    def test_pair_without_confirmed_flag_rejected(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa")
+        with self.assertRaises(BridgeUnavailable):
+            create_pairing(self.workspace, confirmed=False, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_pair_zero_candidates_rejected(self):
+        with self.assertRaises(BridgeUnavailable):
+            create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_pair_multiple_candidates_rejected(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa")
+        self._make_live_socket("bbbbbbbbbbbbbbbbbbbbbbbb")
+        with self.assertRaises(BridgeUnavailable):
+            create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_pair_writes_mode_0600_and_exact_fields(self):
+        socket_path = self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=os.getpid())
+        record = create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+        pair_path = os.path.join(self.runtime_dir, "paired-window.json")
+        self.assertTrue(os.path.exists(pair_path))
+        mode = os.stat(pair_path).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+        with open(pair_path, "r", encoding="utf-8") as handle:
+            on_disk = json.load(handle)
+
+        expected_workspace = os.path.realpath(self.workspace)
+        for payload in (record, on_disk):
+            self.assertEqual(payload["version"], 1)
+            self.assertEqual(payload["identity"], "aaaaaaaaaaaaaaaaaaaaaaaa")
+            self.assertEqual(payload["socketPath"], socket_path)
+            self.assertEqual(payload["serverPid"], os.getpid())
+            self.assertEqual(payload["workspaceRoot"], expected_workspace)
+
+    def test_pair_requires_existing_workspace_directory(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa")
+        missing = os.path.join(self.tmpdir, "does-not-exist")
+        with self.assertRaises(BridgeUnavailable):
+            create_pairing(missing, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+
+class ResolvePairingTests(_PairingFixture):
+    def test_resolve_succeeds_for_matching_live_candidate_and_workspace(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=os.getpid())
+        create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+        candidate = resolve_pairing(self.workspace, uid=self.uid, tmpdir=self.tmpdir)
+        self.assertIsInstance(candidate, BridgeCandidate)
+        self.assertEqual(candidate.identity, "aaaaaaaaaaaaaaaaaaaaaaaa")
+
+    def test_resolve_rejects_workspace_mismatch(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=os.getpid())
+        create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+        other_workspace = os.path.join(self.tmpdir, "other-workspace")
+        os.makedirs(other_workspace, exist_ok=True)
+        with self.assertRaises(BridgeUnavailable):
+            resolve_pairing(other_workspace, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_resolve_rejects_when_no_pair_file_exists(self):
+        with self.assertRaises(BridgeUnavailable):
+            resolve_pairing(self.workspace, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_resolve_rejects_dead_pid_after_pairing(self):
+        identity = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        socket_path = self._make_live_socket(identity, pid=os.getpid())
+        create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+        # Simulate the extension host dying: rewrite metadata with a dead PID.
+        metadata_path = os.path.join(self.runtime_dir, f"bridge-{identity}.json")
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "pid": 2**30, "identity": identity}, handle)
+        os.chmod(metadata_path, 0o600)
+
+        with self.assertRaises(BridgeUnavailable):
+            resolve_pairing(self.workspace, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_resolve_rejects_metadata_change_after_pairing(self):
+        identity = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        self._make_live_socket(identity, pid=os.getpid())
+        create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+        metadata_path = os.path.join(self.runtime_dir, f"bridge-{identity}.json")
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "pid": os.getpid(), "identity": "changed-identity-value"}, handle)
+        os.chmod(metadata_path, 0o600)
+
+        with self.assertRaises(BridgeUnavailable):
+            resolve_pairing(self.workspace, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_resolve_rejects_socket_replaced_after_pairing(self):
+        identity = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        socket_path = self._make_live_socket(identity, pid=os.getpid())
+        create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+        # Close the original listener and replace the socket file with one
+        # bound to a fresh (still-live) listener at the same path: the pair
+        # record's bound identity/pid/workspace still match, but the brief
+        # requires revalidating the live socket itself is unchanged too, so
+        # simulate the strongest case: the old listener is simply gone.
+        for server in self._servers:
+            server.close()
+        self._servers = []
+        os.remove(socket_path)
+
+        with self.assertRaises(BridgeUnavailable):
+            resolve_pairing(self.workspace, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_resolve_rejects_malformed_pair_file(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=os.getpid())
+        pair_path = os.path.join(self.runtime_dir, "paired-window.json")
+        with open(pair_path, "w", encoding="utf-8") as handle:
+            handle.write("{not valid json")
+        os.chmod(pair_path, 0o600)
+
+        with self.assertRaises(BridgeUnavailable):
+            resolve_pairing(self.workspace, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_resolve_rejects_when_zero_live_sockets_remain(self):
+        identity = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        self._make_live_socket(identity, pid=os.getpid())
+        create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+        self._close_servers()
+        self._servers = []
+        metadata_path = os.path.join(self.runtime_dir, f"bridge-{identity}.json")
+        os.remove(metadata_path)
+        socket_path = os.path.join(self.runtime_dir, f"bridge-{identity}.sock")
+        os.remove(socket_path)
+
+        with self.assertRaises(BridgeUnavailable):
+            resolve_pairing(self.workspace, uid=self.uid, tmpdir=self.tmpdir)
+
+    def test_resolve_rejects_when_multiple_live_sockets_now_present(self):
+        identity = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        self._make_live_socket(identity, pid=os.getpid())
+        create_pairing(self.workspace, confirmed=True, uid=self.uid, tmpdir=self.tmpdir)
+
+        # A second, unrelated live candidate appears after pairing (e.g. a
+        # second Comate window activates its own bridge). Even though the
+        # originally paired identity/pid/socket/workspace all still match,
+        # ambiguity among currently-live sockets must fail closed.
+        self._make_live_socket("bbbbbbbbbbbbbbbbbbbbbbbb", pid=os.getpid())
+
+        with self.assertRaises(BridgeUnavailable):
+            resolve_pairing(self.workspace, uid=self.uid, tmpdir=self.tmpdir)
+
 
 class CliTests(unittest.TestCase):
     """Exercise the probe/send-input0 CLI subcommands as subprocesses."""
@@ -579,6 +852,119 @@ class CliTests(unittest.TestCase):
             self.assertIn(b"bridge unavailable", result.stderr)
             self.assertNotIn(b"test mode", result.stderr)
             self.assertNotIn(b"unknown kind", result.stderr)
+
+
+class PairedCliTests(_PairingFixture):
+    """Exercise the pair/probe-paired/send-input0 --paired-workspace CLI as subprocesses."""
+
+    def _run(self, args, input_bytes=b"", extra_env=None):
+        repo_root = Path(__file__).resolve().parents[1]
+        env = dict(os.environ)
+        env["TMPDIR"] = self.tmpdir
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            [sys.executable, "-m", "bridge.comate_bridge_client", *args],
+            input=input_bytes,
+            cwd=repo_root,
+            capture_output=True,
+            env=env,
+        )
+
+    def test_pair_cli_requires_confirmed_flag(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=os.getpid())
+        result = self._run(["pair", "--workspace-root", self.workspace])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"--confirmed-current-window", result.stderr)
+
+    def test_pair_and_probe_paired_cli_round_trip(self):
+        self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=os.getpid())
+        pair_result = self._run(
+            ["pair", "--workspace-root", self.workspace, "--confirmed-current-window"]
+        )
+        self.assertEqual(pair_result.returncode, 0, msg=pair_result.stderr)
+
+        probe_result = self._run(["probe-paired", "--workspace-root", self.workspace])
+        self.assertEqual(probe_result.returncode, 0, msg=probe_result.stderr)
+        payload = json.loads(probe_result.stdout.decode("utf-8"))
+        self.assertEqual(payload["identity"], "aaaaaaaaaaaaaaaaaaaaaaaa")
+
+    def test_probe_paired_cli_exits_2_when_unpaired(self):
+        result = self._run(["probe-paired", "--workspace-root", self.workspace])
+        self.assertEqual(result.returncode, 2)
+
+    def test_send_input0_paired_workspace_cli_delivers_request(self):
+        socket_path = self._make_live_socket("aaaaaaaaaaaaaaaaaaaaaaaa", pid=os.getpid())
+        # Replace the plain listening socket with a fake bridge server that
+        # actually answers requests, reusing the identity/metadata already on
+        # disk. Unlike FakeBridgeServer (which accepts exactly one
+        # connection), this loop keeps accepting because `pair` and every
+        # `resolve_pairing` revalidation each open and close their own
+        # bounded liveness-check connection before send-input0's real
+        # request connection arrives.
+        for server in self._servers:
+            server.close()
+        self._servers = []
+        os.remove(socket_path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(socket_path)
+        listener.listen(5)
+        stop = threading.Event()
+
+        def serve_forever():
+            while not stop.is_set():
+                listener.settimeout(0.2)
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    continue
+                threading.Thread(target=_echo_handler, args=(conn,), daemon=True).start()
+
+        thread = threading.Thread(target=serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(listener.close)
+
+        pair_result = self._run(
+            ["pair", "--workspace-root", self.workspace, "--confirmed-current-window"]
+        )
+        self.assertEqual(pair_result.returncode, 0, msg=pair_result.stderr)
+
+        fields = ["cli", "cli: shell", "/tmp", "/bin/bash", "", "0"]
+        result = self._run(
+            ["send-input0", "--paired-workspace", self.workspace],
+            input_bytes=("\0".join(fields) + "\0").encode(),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_send_input0_rejects_paired_workspace_with_ipc_hook(self):
+        result = self._run(
+            [
+                "send-input0",
+                "--paired-workspace",
+                self.workspace,
+                "--ipc-hook",
+                "/tmp/vscode-ipc-a.sock",
+            ],
+            input_bytes=b"cli\0name\0/tmp\0/bin/bash\0\0" + b"0\0",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"mutually exclusive", result.stderr)
+
+    def test_send_input0_rejects_paired_workspace_with_test_socket(self):
+        result = self._run(
+            [
+                "send-input0",
+                "--paired-workspace",
+                self.workspace,
+                "--test-mode",
+                "--socket",
+                os.path.join(self.runtime_dir, "bridge-x.sock"),
+            ],
+            input_bytes=b"cli\0name\0/tmp\0/bin/bash\0\0" + b"0\0",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"mutually exclusive", result.stderr)
 
 
 if __name__ == "__main__":

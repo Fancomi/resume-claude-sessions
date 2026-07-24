@@ -491,6 +491,19 @@ launch_seq() {
 #      window at all. This is the preferred path whenever the bridge is
 #      actually running in this window.
 #
+#      Routing is via a user-confirmed pairing (bridge/comate_bridge_client.py
+#      `pair`/`probe-paired`/`send-input0 --paired-workspace`), NOT via
+#      `VSCODE_IPC_HOOK_CLI`: an isolated live test proved that newly created
+#      terminals in the SAME window observe a different IPC hook value than
+#      the terminal that launched them, so the hook cannot identify "this
+#      window" for routing purposes. The pairing instead binds trust to the
+#      sole currently-live bridge socket's identity, its extension-host PID,
+#      and the expected workspace root, created once via
+#      `scripts/pair-comate-bridge.sh --confirmed-current-window` and
+#      revalidated on every use; see
+#      docs/superpowers/specs/2026-07-24-comate-terminal-bridge-design.md for
+#      the full rationale.
+#
 #   2. launch_vscode_new_window — the pre-existing .code-workspace mechanism:
 #      VSCode exposes no CLI to spawn/inject terminals in the current window
 #      (checked: comate/code only do -n/-r/-a/-g), so parallel auto-launch
@@ -530,9 +543,13 @@ vscode_cli() {   # echo a usable VSCode/comate CLI path, or empty
 
 # --- bridge path: deliver terminals into the CURRENT window, no new window ---
 launch_vscode_bridge() {
-  local client="$SCRIPT_DIR/bridge/comate_bridge_client.py" ipc="${VSCODE_IPC_HOOK_CLI:-}"
-  [ -n "$ipc" ] && [ -f "$client" ] || return 2
-  python3 "$client" probe --ipc-hook "$ipc" >/dev/null 2>&1 || return 2
+  local client="$SCRIPT_DIR/bridge/comate_bridge_client.py"
+  [ -f "$client" ] || return 2
+
+  local deffolder="/root/paddlejob/workspace/env_run/penghaotian"
+  [ -d "$deffolder" ] || deffolder="$PWD"
+  local folder="${RESUME_VSCODE_FOLDER:-$deffolder}"
+  python3 "$client" probe-paired --workspace-root "$folder" >/dev/null 2>&1 || return 2
 
   local i dangerous=0
   [ "${RESUME_SKIP_PERMISSIONS:-0}" = "1" ] && dangerous=1
@@ -546,7 +563,7 @@ launch_vscode_bridge() {
           cli "cli: ${sel_name[$i]}" "${sel_cwd[$i]}" "${SHELL:-/bin/bash}" '' 0
       fi
     done
-  } | python3 "$client" send-input0 --ipc-hook "$ipc"
+  } | python3 "$client" send-input0 --paired-workspace "$folder"
 }
 
 # --- fallback path: fixed -n, new window, no reuse/reload -------------------

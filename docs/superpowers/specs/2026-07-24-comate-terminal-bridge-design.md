@@ -163,3 +163,25 @@ The fallback always opens a separate window and never changes the invoking windo
 - First installation does not reload the current window.
 - Tests operate only in a newly opened test window.
 - If exact-window routing cannot be proven, the bridge refuses to run and safely opens a separate window instead.
+
+## Implementation-Result Addendum (2026-07-24): IPC-hook identity disproved; replaced with confirmed pairing
+
+The "Exact-Window Routing" section above assumed the extension host and the invoking integrated terminal observe the same `VSCODE_IPC_HOOK_CLI` value, and that this document's own "Before implementation" gate would catch it if that were false. The isolated live test (Task 6) ran that gate and disproved the assumption:
+
+- `vscode.window.createTerminal()` from the installed extension does append terminals into the user's actual current main Comate window — that part of the design held.
+- However, `VSCODE_IPC_HOOK_CLI` observed by a **newly created terminal in that same window** does not match the value the extension host (or any other terminal in the window) would derive the same socket identity from. The user directly observed the two test terminals (`bridge-test-identity`, `bridge-test-second`) land in their main window, and comparing IPC hook values across terminals in that one window showed they differ. So the hook is per-terminal, not per-window, and cannot serve as a stable window identity for routing.
+
+This invalidates `sha256(VSCODE_IPC_HOOK_CLI)[0:24]` as the socket-selection key for the *normal* (non-test) launcher path. It does not invalidate the extension/socket/protocol machinery itself (identity derivation, metadata file, JSON-line protocol, 1 MiB/100-terminal limits, delivery-uncertainty semantics) — only the "which socket do I send to" decision needed a different, non-IPC-hook-derived source of trust.
+
+### Approved replacement: user-confirmed PID-bound pairing
+
+Since no CLI-observable, terminal-independent signal reliably identifies "the window that just invoked this script" (Comate 3.1.1 exposes no such introspection), routing trust is instead established explicitly by the user, once, and re-validated on every subsequent use:
+
+1. **Discovery** (`discover_live_candidates`): enumerate every socket under the private per-uid runtime directory (`/tmp/resume-claude-sessions-$UID`, or an injected test tempdir) whose adjacent metadata file is mode 0600, has protocol version 1, has an `identity` field matching its own filename, has a `pid` field that is currently a live process, and whose socket accepts a bounded connect. Anything failing any of these checks is silently excluded, never assumed live.
+2. **Pairing** (`create_pairing`, exposed as `pair --workspace-root ... --confirmed-current-window`, wrapped by `scripts/pair-comate-bridge.sh`): requires the literal `--confirmed-current-window` opt-in (the user's explicit assertion that, at the moment they run it, exactly one Comate window — theirs — has an active bridge extension host). Refuses unless discovery finds **exactly one** live candidate. On success, atomically (temp file + `os.replace`) writes a mode-0600 pair file binding `version`, `identity`, `socketPath`, `serverPid`, and the `realpath`-canonicalized `workspaceRoot`.
+3. **Resolution** (`resolve_pairing`, exposed as `probe-paired` / `send-input0 --paired-workspace`): on every normal-launcher invocation, re-derives everything from scratch rather than trusting the pair file's claims — re-reads and re-validates the pair file, re-runs full discovery, and requires the *currently* live candidate set to still be exactly one entry whose identity, socket path, and PID all still equal the bound values, and whose workspace root still matches. A dead PID (host restarted), a changed identity/socket, a workspace mismatch, zero or multiple currently-live sockets (even if the originally paired one still checks out — ambiguity itself is disqualifying), a malformed pair file, or a failed connect all fail closed with the bridge reported unavailable *before* any request bytes are sent (CLI exit 2), which the launcher's existing dispatcher already treats as safe to fall back to the fixed `comate -n` new-window path.
+
+Trust is therefore bound to three things simultaneously — the live socket's own identity, the extension-host process that's still alive, and the expected workspace — rather than to any environment variable read from the invoking terminal. `VSCODE_IPC_HOOK_CLI` is no longer read anywhere in the normal (non-test-mode) send path; the existing `--ipc-hook`/`probe`/plain `send-input0` CLI surface is retained only for the test-mode/private-socket-override path already used by the guarded integration test script, and is now mutually exclusive with `--paired-workspace` so the two trust models can never be mixed in one invocation.
+
+The existing post-send delivery classification (exit 3 = uncertain, exit 4 = terminal-creation errors reported by the server, no fallback in either case) is unchanged: pairing only replaces the pre-send "which socket" decision, not what happens once bytes may have been written to it.
+

@@ -55,9 +55,9 @@ powershell -ExecutionPolicy Bypass -File resume-claude-sessions.ps1
 ## Comate 终端桥接（VSCode / Comate 远程）
 
 在 Comate/VSCode 远程会话里，`resume-claude-sessions.sh` 会优先尝试通过一个
-per-window 的本地 Unix socket 直接把要恢复的会话作为「集成终端」追加到**当前
-调用它的这个窗口**里，不新开窗口、不 reload、不复用（`-r`）。只有桥接不可用
-时才回退到固定用 `-n` 打开一个新窗口。
+本地 Unix socket 直接把要恢复的会话作为「集成终端」追加到**当前窗口**里，不
+新开窗口、不 reload、不复用（`-r`）。只有桥接不可用时才回退到固定用 `-n`
+打开一个新窗口。
 
 安装桥接扩展（不会 reload 任何窗口）：
 
@@ -68,14 +68,40 @@ per-window 的本地 Unix socket 直接把要恢复的会话作为「集成终�
 bash resume-claude-sessions.sh
 ```
 
+### 用户确认的窗口配对（必须先手动确认一次）
+
+隔离测试证明：同一个窗口里新建的终端所看到的 `VSCODE_IPC_HOOK_CLI` 值并**不**
+稳定——同一窗口内不同终端的这个变量取值会不一样，所以它不能用来识别「当前
+这个窗口」。因此正常启动路径**不再**依赖 `VSCODE_IPC_HOOK_CLI` 做路由，而是
+改为一次性的、用户显式确认的「配对」：把当前**唯一存活**的桥接 socket 绑定
+到扩展主机 PID 和期望的工作区根目录上。
+
+在你确认当前只打开了一个 Comate/VSCode 窗口（因而只有一个存活的桥接
+socket）之后，运行：
+
+```bash
+./scripts/pair-comate-bridge.sh --confirmed-current-window
+```
+
+该脚本只调用 `bridge/comate_bridge_client.py pair`，绝不调用
+comate/code、绝不打开新窗口、绝不 reload/复用窗口、绝不创建终端。确认只对
+**当前存活的扩展主机 PID** 有效：一旦该 PID 变化（例如 Comate 自然重启），
+配对自动失效，需要重新运行本脚本确认一次。
+
+正常启动时，`resume-claude-sessions.sh` 只会使用这个已确认的配对：如果配对
+不存在、工作区不匹配、绑定的 PID 已经不是存活进程、绑定的 socket/身份发生了
+变化，或者当前存活的桥接 socket 数量不是恰好一个（0 个或多个都算歧义），
+则在发送任何请求之前就判定桥接不可用（退出码 2），直接回退到固定 `-n` 新
+窗口，绝不猜测或尝试其它 socket。
+
 行为总结：
 
-- **桥接可用**：把每个选中的会话作为独立终端追加到当前调用窗口，当前窗口
-  已有的终端、编辑器、其它窗口状态**一律不会被修改**。
-- **桥接不可用**（扩展未安装/未激活/`VSCODE_IPC_HOOK_CLI` 缺失等）：回退到
-  固定 `-n` 打开一个新窗口，根目录为 `penghaotian`（或 `RESUME_VSCODE_FOLDER`
-  指定的目录），任务通过 `runOn: folderOpen` 自动并行启动；**绝不**使用
-  `-r`/`--reuse-window`/reload 当前窗口。
+- **桥接可用**（存在有效的已确认配对）：把每个选中的会话作为独立终端追加到
+  已配对的窗口，该窗口已有的终端、编辑器、其它窗口状态**一律不会被修改**。
+- **桥接不可用**（未运行过 `pair-comate-bridge.sh`、配对已失效、扩展未安装/
+  未激活等）：回退到固定 `-n` 打开一个新窗口，根目录为 `penghaotian`（或
+  `RESUME_VSCODE_FOLDER` 指定的目录），任务通过 `runOn: folderOpen` 自动并行
+  启动；**绝不**使用 `-r`/`--reuse-window`/reload 当前窗口。
 - 无论走哪条路径，**已存在的终端永远不会被读取、复用或关闭**——桥接只调用
   `vscode.window.createTerminal(...)` 新建终端，回退路径只写一个全新覆盖的
   `.code-workspace` 文件。
