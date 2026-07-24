@@ -24,18 +24,29 @@
 # Test/override:
 #   RESUME_FORCE_LAUNCH=terminal|vscode|tmux|seq   RESUME_DRY_RUN=1
 #   RESUME_AUTO_SELECT=1 (take defaults, no prompt)
-set -euo pipefail
+# NOTE: no `set -e` here. This script is written throughout in the
+# `[ cond ] && action` idiom (move(), case arms, launch loops); under errexit a
+# falsy test returns non-zero and aborts the script mid-interaction. Critical
+# steps below have explicit `|| { echo…; exit 1; }` guards instead.
+set -uo pipefail
 
 PROJECTS_ROOT="${RESUME_PROJECTS_ROOT:-$HOME/.claude/projects}"
 CLAUDE_CMD="$(command -v claude || true)"; [ -z "$CLAUDE_CMD" ] && CLAUDE_CMD="claude"
-RESUME_FLAGS="--dangerously-skip-permissions"
+# Resume normally (permissions ON). Dev machines should NOT skip permission
+# prompts. Opt in explicitly with RESUME_SKIP_PERMISSIONS=1 if you really want
+# `--dangerously-skip-permissions`.
+if [ "${RESUME_SKIP_PERMISSIONS:-0}" = "1" ]; then
+  RESUME_FLAGS="--dangerously-skip-permissions"
+else
+  RESUME_FLAGS=""
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUI_HELPER="$SCRIPT_DIR/resume-gui.py"
 
 [ -d "$PROJECTS_ROOT" ] || { echo "Projects dir not found: $PROJECTS_ROOT" >&2; exit 1; }
 
 # --- portable helpers --------------------------------------------------------
-mtime_epoch() { stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1"; }
+mtime_epoch() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null; }
 first_cwd() {
   grep -m1 -o '"cwd"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" 2>/dev/null \
     | sed -E 's/.*"cwd"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' | sed 's/\\\//\//g'
@@ -101,15 +112,27 @@ detect_launch() {
 LAUNCH_MODE="$(detect_launch)"
 # ============================ SELECTION (checkbox TUI) =======================
 # rows[] maps visual row -> session index, or "H:<date>" for a date header.
-rows=(); build_rows() {
+# Collapsed dates hide their session rows (tree fold). ←/→ toggle the fold.
+rows=(); nrows=0
+collapsed_dates=" "
+is_collapsed()    { case "$collapsed_dates" in *" $1 "*) return 0;; *) return 1;; esac; }
+set_collapsed()   { is_collapsed "$1" || collapsed_dates="$collapsed_dates$1 "; }
+unset_collapsed() { collapsed_dates="${collapsed_dates/ $1 / }"; }
+build_rows() {
   rows=(); local i last=""
   for ((i=0;i<total;i++)); do
     [ "${sel_date[$i]}" != "$last" ] && { rows+=("H:${sel_date[$i]}"); last="${sel_date[$i]}"; }
+    is_collapsed "${sel_date[$i]}" && continue
     rows+=("$i")
   done
+  nrows="${#rows[@]}"
+}
+row_of_header() {   # echo visual row of header for date $1 (or current cur)
+  local d="$1" r
+  for ((r=0;r<nrows;r++)); do [ "${rows[$r]}" = "H:$d" ] && { echo "$r"; return; }; done
+  echo "$cur"
 }
 build_rows
-nrows="${#rows[@]}"
 
 chosen_idx=()
 collect_default() { chosen_idx=(); local i; for ((i=0;i<total;i++)); do [ "${sel_checked[$i]}" = "1" ] && chosen_idx+=("$i"); done; return 0; }
@@ -173,14 +196,15 @@ select_tui() {
   # start cursor on first real session
   for ((r=0;r<nrows;r++)); do case "${rows[$r]}" in H:*) ;; *) cur=$r; break;; esac; done
   tput civis 2>/dev/null || true
+  printf '\033[2J'                            # one full clear up front; draw() is incremental after
   trap 'tput cnorm 2>/dev/null || true' RETURN
 
   term_rows() { local n; n="$(tput lines 2>/dev/null || echo 24)"; [ "$n" -ge 6 ] || n=24; echo "$n"; }
 
   draw() {
-    local lines vis top bot r item si mark grp cli hd
+    local lines vis top bot r item si mark grp cli hd fold
     lines="$(term_rows)"
-    vis=$((lines - 4))                       # reserve: title + hint + status + prompt safety
+    vis=$((lines - 5))                       # reserve: title + 2 hint lines + status + prompt safety
     [ "$vis" -lt 3 ] && vis=3
     # keep cursor within [off, off+vis)
     [ "$cur" -lt "$off" ] && off="$cur"
@@ -188,33 +212,51 @@ select_tui() {
     [ "$off" -lt 0 ] && off=0
     top="$off"; bot=$((off+vis)); [ "$bot" -gt "$nrows" ] && bot="$nrows"
 
-    tput clear 2>/dev/null || printf '\033[2J\033[H'
-    printf "\033[1m Claude 会话 · 按日期分组\033[0m \033[2m(↑↓移动 空格勾选 g组 c加CLI a全选 n全不选 /搜索 回车确认 q退出)\033[0m\n"
+    # Flicker-free: home the cursor and clear each line as we overwrite it
+    # (\033[K), then clear anything left below (\033[J). Never full-clear.
+    printf '\033[H'
+    printf "\033[1m Claude 会话 · 按日期分组\033[0m\033[K\n"
+    printf " \033[2m↑↓/jk 移动 · ←折叠 →展开 · f 下翻页 b 上翻页 · [ ] 上/下一日期\033[0m\033[K\n"
+    printf " \033[2m空格勾选 · g 设窗口组 · c 加CLI标签 · a 全选 n 全不选 · / 搜索 · 回车确认 · q 退出\033[0m\033[K\n"
     for ((r=top;r<bot;r++)); do
       item="${rows[$r]}"
       if [ "${item:0:2}" = "H:" ]; then
         hd="${item:2}"
+        is_collapsed "$hd" && fold="▶" || fold="▼"
         [ "$(group_all_checked_in_date "$hd")" = "1" ] && mark="[\033[32m✔\033[0m]" || mark="[ ]"
-        if [ "$r" -eq "$cur" ]; then printf "\033[7m ▼ %b %s \033[0m\n" "$mark" "$(day_label "$hd")"
-        else printf " \033[36m▼\033[0m %b \033[36m%s\033[0m\n" "$mark" "$(day_label "$hd")"; fi
+        if [ "$r" -eq "$cur" ]; then printf "\033[7m %s %b %s \033[0m\033[K\n" "$fold" "$mark" "$(day_label "$hd")"
+        else printf " \033[36m%s\033[0m %b \033[36m%s\033[0m\033[K\n" "$fold" "$mark" "$(day_label "$hd")"; fi
       else
         si="$item"
         [ "${sel_checked[$si]}" = "1" ] && mark="[\033[32m✔\033[0m]" || mark="[ ]"
         grp="G${sel_group[$si]}"
         [ "${sel_cli[$si]}" = "1" ] && cli="\033[33m+CLI\033[0m" || cli="    "
-        if [ "$r" -eq "$cur" ]; then printf "\033[7m   %b %-4s %b %s  %s \033[0m\n" "$mark" "$grp" "$cli" "${sel_time[$si]}" "${sel_cwd[$si]}"
-        else printf "   %b \033[2m%-4s\033[0m %b %s  %s\n" "$mark" "$grp" "$cli" "${sel_time[$si]}" "${sel_cwd[$si]}"; fi
+        if [ "$r" -eq "$cur" ]; then printf "\033[7m   %b %-4s %b %s  %s \033[0m\033[K\n" "$mark" "$grp" "$cli" "${sel_time[$si]}" "${sel_cwd[$si]}"
+        else printf "   %b \033[2m%-4s\033[0m %b %s  %s\033[K\n" "$mark" "$grp" "$cli" "${sel_time[$si]}" "${sel_cwd[$si]}"; fi
       fi
     done
     local shown=$((bot-top)) nsel=0 i
     for ((i=0;i<total;i++)); do [ "${sel_checked[$i]}" = "1" ] && nsel=$((nsel+1)); done
-    printf " \033[2m[%d-%d/%d 行 · 已选 %d]  相同 G 号=合并到一个窗口的多个标签页\033[0m\n" \
+    printf " \033[2m[%d-%d/%d 行 · 已选 %d]  相同 G 号=合并到一个窗口的多个标签页\033[0m\033[K\n" \
       $((top+1)) "$bot" "$nrows" "$nsel"
+    printf '\033[J'                          # erase anything below the status line
   }
   move() { local dir="$1"; cur=$((cur+dir)); [ "$cur" -lt 0 ] && cur=0; [ "$cur" -ge "$nrows" ] && cur=$((nrows-1)); }
-  page() { local lines vis; lines="$(term_rows)"; vis=$((lines-4)); [ "$vis" -lt 3 ] && vis=3; move $(( $1 * vis )); }
+  page() { local lines vis; lines="$(term_rows)"; vis=$((lines-5)); [ "$vis" -lt 3 ] && vis=3; move $(( $1 * vis )); }
   # jump to next/prev date header
   jump_hdr() { local dir="$1" i="$cur"; while :; do i=$((i+dir)); [ "$i" -lt 0 ] && return; [ "$i" -ge "$nrows" ] && return; case "${rows[$i]}" in H:*) cur="$i"; return;; esac; done; }
+  fold_current() {   # ← : collapse the date group the cursor is in
+    local d
+    if [ "${item:0:2}" = "H:" ]; then d="${item:2}"; else d="${sel_date[$item]}"; fi
+    set_collapsed "$d"; build_rows
+    cur="$(row_of_header "$d")"
+    [ "$cur" -ge "$nrows" ] && cur=$((nrows-1)); [ "$cur" -lt 0 ] && cur=0
+  }
+  unfold_current() {  # → : expand the date group under the cursor
+    [ "${item:0:2}" = "H:" ] || return
+    unset_collapsed "${item:2}"; build_rows
+    [ "$cur" -ge "$nrows" ] && cur=$((nrows-1))
+  }
 
   while true; do
     draw
@@ -223,6 +265,7 @@ select_tui() {
       read -rsn2 -t 0.01 rest || rest=""
       case "$rest" in
         '[A') key='k';; '[B') key='j';;
+        '[C') key='RIGHT';; '[D') key='LEFT';;          # →expand  ←collapse
         '[5') read -rsn1 -t 0.01 _ || true; key='PU';;   # PageUp  (ESC[5~)
         '[6') read -rsn1 -t 0.01 _ || true; key='PD';;   # PageDown(ESC[6~)
         '[H') cur=0; key='';; '[F') cur=$((nrows-1)); key='';;
@@ -232,7 +275,8 @@ select_tui() {
     item="${rows[$cur]}"
     case "$key" in
       k) move -1 ;;  j) move 1 ;;
-      PU) page -1 ;; PD) page 1 ;;
+      LEFT)  fold_current ;;  RIGHT) unfold_current ;;
+      PU|b|B) page -1 ;; PD|f|F) page 1 ;;         # f/b page down/up (no Page keys needed)
       '[') jump_hdr -1 ;;  ']') jump_hdr 1 ;;      # [ / ] jump between date groups
       ' ')
         if [ "${item:0:2}" = "H:" ]; then toggle_date_group "${item:2}"
@@ -438,40 +482,12 @@ launch_seq() {
   done
 }
 
-# --- VSCode: tasks.json, grouped dedicated panels ----------------------------
-launch_vscode() {
-  local root="${RESUME_VSCODE_DIR:-$PWD}"; mkdir -p "$root/.vscode"
-  local f="$root/.vscode/tasks.json" i label cmd json="" deps=""
-  add_task() { # $1 label  $2 shell-cmd  $3 group-id
-    local l="$1" c="$2" grp="$3"
-    l="${l//\"/\'}"; c="${c//\\/\\\\}"; c="${c//\"/\\\"}"
-    [ -n "$json" ] && json+=","
-    json+='
-    { "label": "'"$l"'", "type": "shell", "command": "'"$c"'",
-      "presentation": { "group": "claude-G'"$grp"'", "panel": "dedicated", "reveal": "always" },
-      "problemMatcher": [] }'
-    [ -n "$deps" ] && deps+=","; deps+='"'"$l"'"'
-  }
-  for i in "${chosen_idx[@]}"; do
-    label="resume: ${sel_name[$i]} [${sel_time[$i]}]"
-    cmd="cd '${sel_cwd[$i]//\'/\'\\\'\'}' && $(resume_cmd "$i")"
-    add_task "$label" "$cmd" "${sel_group[$i]}"
-    [ "${sel_cli[$i]}" = "1" ] && add_task "cli: ${sel_name[$i]}" "cd '${sel_cwd[$i]//\'/\'\\\'\'}' && echo 'manual CLI'; exec \$SHELL" "${sel_group[$i]}"
-  done
-  cat > "$f" <<EOF
-{
-  "version": "2.0.0",
-  "tasks": [$json,
-    { "label": "resume: all selected", "dependsOn": [$deps],
-      "dependsOrder": "parallel",
-      "group": { "kind": "build", "isDefault": true }, "problemMatcher": [] }
-  ]
-}
-EOF
-  echo "已写入 $f （${#chosen_idx[@]} 个会话，按窗口组分面板）。"
-  echo "VSCode 里按 Ctrl/Cmd+Shift+B 运行 “resume: all selected”，或 Terminal>Run Task… 单独选。"
-  command -v code >/dev/null 2>&1 && { code "$root" >/dev/null 2>&1 || true; }
-}
+# --- VSCode: run directly in the integrated terminal ------------------------
+# No `code` CLI can open+inject integrated terminals, and writing tasks.json
+# forces a manual second step — so we execute right here instead. Sequentially,
+# in this terminal: each session runs, and exiting it moves on to the next.
+# (No tmux.)
+launch_vscode() { launch_seq; }
 
 if [ "${RESUME_DRY_RUN:-}" = "1" ]; then
   echo "[dry-run] launch=$LAUNCH_MODE  选中 ${#chosen_idx[@]} 个，组:$chosen_groups"
