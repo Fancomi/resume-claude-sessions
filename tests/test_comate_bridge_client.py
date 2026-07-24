@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from bridge.comate_bridge_client import (
+    BridgeDeliveryUncertain,
     BridgeUnavailable,
     build_terminals,
     send_request,
@@ -135,6 +136,28 @@ def _echo_handler(conn):
     conn.sendall((json.dumps(response) + "\n").encode("utf8"))
 
 
+def _make_response_handler(build_response):
+    """Build a handler that replies with a caller-supplied response payload,
+    derived from the parsed request, instead of the default echo shape."""
+
+    def handler(conn):
+        data = b""
+        conn.settimeout(1.0)
+        while b"\n" not in data:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        try:
+            request = json.loads(data.split(b"\n", 1)[0].decode("utf8"))
+        except (ValueError, IndexError):
+            return
+        response = build_response(request)
+        conn.sendall((json.dumps(response) + "\n").encode("utf8"))
+
+    return handler
+
+
 def _silent_handler(conn):
     # Accept the connection and read the request but never reply, to trigger a client timeout.
     data = b""
@@ -164,11 +187,11 @@ class SendRequestTests(unittest.TestCase):
         finally:
             server.close()
 
-    def test_send_request_raises_bridge_unavailable_on_timeout(self):
+    def test_send_request_raises_bridge_delivery_uncertain_on_response_timeout(self):
         server = FakeBridgeServer(_silent_handler)
         try:
             terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
-            with self.assertRaises(BridgeUnavailable):
+            with self.assertRaises(BridgeDeliveryUncertain):
                 send_request(
                     "unused-ipc-hook", terminals, timeout=0.05, _socket_path=server.socket_path
                 )
@@ -179,11 +202,154 @@ class SendRequestTests(unittest.TestCase):
         server = FakeBridgeServer(_silent_handler)
         try:
             terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
-            with self.assertRaises(BridgeUnavailable):
+            with self.assertRaises(BridgeDeliveryUncertain):
                 send_request(
                     "unused-ipc-hook", terminals, timeout=0.05, _socket_path=server.socket_path
                 )
             self.assertEqual(server.connection_count, 1)
+        finally:
+            server.close()
+
+    def test_send_request_raises_bridge_unavailable_on_connect_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_socket = os.path.join(tmpdir, "no-such-bridge.sock")
+            terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
+            with self.assertRaises(BridgeUnavailable):
+                send_request(
+                    "unused-ipc-hook", terminals, timeout=0.05, _socket_path=missing_socket
+                )
+
+    def test_send_request_rejects_boolean_created(self):
+        handler = _make_response_handler(
+            lambda request: {
+                "version": 1,
+                "requestId": request["requestId"],
+                "created": True,
+                "errors": [],
+            }
+        )
+        server = FakeBridgeServer(handler)
+        try:
+            terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
+            with self.assertRaises(BridgeDeliveryUncertain):
+                send_request(
+                    "unused-ipc-hook", terminals, timeout=2.0, _socket_path=server.socket_path
+                )
+        finally:
+            server.close()
+
+    def test_send_request_rejects_non_integer_created(self):
+        handler = _make_response_handler(
+            lambda request: {
+                "version": 1,
+                "requestId": request["requestId"],
+                "created": "1",
+                "errors": [],
+            }
+        )
+        server = FakeBridgeServer(handler)
+        try:
+            terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
+            with self.assertRaises(BridgeDeliveryUncertain):
+                send_request(
+                    "unused-ipc-hook", terminals, timeout=2.0, _socket_path=server.socket_path
+                )
+        finally:
+            server.close()
+
+    def test_send_request_rejects_created_greater_than_requested_count(self):
+        handler = _make_response_handler(
+            lambda request: {
+                "version": 1,
+                "requestId": request["requestId"],
+                "created": len(request["terminals"]) + 1,
+                "errors": [],
+            }
+        )
+        server = FakeBridgeServer(handler)
+        try:
+            terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
+            with self.assertRaises(BridgeDeliveryUncertain):
+                send_request(
+                    "unused-ipc-hook", terminals, timeout=2.0, _socket_path=server.socket_path
+                )
+        finally:
+            server.close()
+
+    def test_send_request_rejects_negative_created(self):
+        handler = _make_response_handler(
+            lambda request: {
+                "version": 1,
+                "requestId": request["requestId"],
+                "created": -1,
+                "errors": [],
+            }
+        )
+        server = FakeBridgeServer(handler)
+        try:
+            terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
+            with self.assertRaises(BridgeDeliveryUncertain):
+                send_request(
+                    "unused-ipc-hook", terminals, timeout=2.0, _socket_path=server.socket_path
+                )
+        finally:
+            server.close()
+
+    def test_send_request_accepts_zero_created_with_errors(self):
+        handler = _make_response_handler(
+            lambda request: {
+                "version": 1,
+                "requestId": request["requestId"],
+                "created": 0,
+                "errors": ["failed to spawn terminal"],
+            }
+        )
+        server = FakeBridgeServer(handler)
+        try:
+            terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
+            response = send_request(
+                "unused-ipc-hook", terminals, timeout=2.0, _socket_path=server.socket_path
+            )
+            self.assertEqual(response["created"], 0)
+            self.assertEqual(response["errors"], ["failed to spawn terminal"])
+        finally:
+            server.close()
+
+    def test_send_request_rejects_non_list_errors(self):
+        handler = _make_response_handler(
+            lambda request: {
+                "version": 1,
+                "requestId": request["requestId"],
+                "created": 1,
+                "errors": "boom",
+            }
+        )
+        server = FakeBridgeServer(handler)
+        try:
+            terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
+            with self.assertRaises(BridgeDeliveryUncertain):
+                send_request(
+                    "unused-ipc-hook", terminals, timeout=2.0, _socket_path=server.socket_path
+                )
+        finally:
+            server.close()
+
+    def test_send_request_rejects_errors_with_non_string_items(self):
+        handler = _make_response_handler(
+            lambda request: {
+                "version": 1,
+                "requestId": request["requestId"],
+                "created": 1,
+                "errors": [{"message": "boom"}],
+            }
+        )
+        server = FakeBridgeServer(handler)
+        try:
+            terminals = [{"name": "one", "cwd": "/tmp", "command": "printf one"}]
+            with self.assertRaises(BridgeDeliveryUncertain):
+                send_request(
+                    "unused-ipc-hook", terminals, timeout=2.0, _socket_path=server.socket_path
+                )
         finally:
             server.close()
 

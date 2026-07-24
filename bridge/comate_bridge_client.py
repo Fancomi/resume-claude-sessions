@@ -44,8 +44,8 @@ class BridgeUnavailable(Exception):
     """Raised when the bridge cannot be reached before any bytes are sent.
 
     Callers may safely retry or fall back (e.g. to opening a new window) when
-    this is raised, because no request bytes were sent yet, or the failure is
-    known to have happened strictly before the socket accepted any data.
+    this is raised, because it is only raised for connect-phase failures,
+    strictly before any request bytes are written to the socket.
     """
 
 
@@ -210,14 +210,17 @@ def send_request(
 
     Delivery-state exit semantics: once the connection is established and
     bytes have been written to the socket, this function never retries or
-    resends — a failure after that point is surfaced as
-    ``BridgeDeliveryUncertain`` rather than silently swallowed or retried,
-    because the server may already be creating terminals. A failure to even
-    connect is surfaced as ``BridgeUnavailable``, which is safe to fall back
-    on since nothing was sent.
+    resends — a failure after that point, including a timeout while waiting
+    for the response, is surfaced as ``BridgeDeliveryUncertain`` rather than
+    silently swallowed or retried, because the server may already be
+    creating terminals and the request bytes may already have been
+    delivered. A failure to even connect is surfaced as
+    ``BridgeUnavailable``, which is safe to fall back on since nothing was
+    sent.
 
     Returns the parsed response dict with ``version``, ``requestId``,
-    ``created``, and ``errors`` verified against the request.
+    ``created`` (an int in ``[0, len(terminals)]``), and ``errors`` (a list
+    of strings) verified against the request.
 
     ``_socket_path`` is a private test-only override letting the test suite
     point at a temporary fake-server socket without threading a real
@@ -257,7 +260,10 @@ def send_request(
         try:
             response = _read_json_line(sock, MAX_BYTES)
         except socket_module.timeout as error:
-            raise BridgeUnavailable(f"timed out waiting for bridge response: {error}") from error
+            # Request bytes were already sent: a timeout here does not mean
+            # the request never arrived, so this must not be treated as safe
+            # to retry or fall back on.
+            raise BridgeDeliveryUncertain(f"timed out waiting for bridge response: {error}") from error
         except OSError as error:
             raise BridgeDeliveryUncertain(f"connection failed while reading response: {error}") from error
     finally:
@@ -271,6 +277,18 @@ def send_request(
         )
     if "created" not in response or "errors" not in response:
         raise BridgeDeliveryUncertain("bridge response missing created/errors fields")
+
+    created = response.get("created")
+    if not isinstance(created, int) or isinstance(created, bool):
+        raise BridgeDeliveryUncertain(f"bridge response 'created' is not an integer: {created!r}")
+    if created < 0 or created > len(terminals):
+        raise BridgeDeliveryUncertain(
+            f"bridge response 'created' ({created}) is out of range for {len(terminals)} requested terminal(s)"
+        )
+
+    errors = response.get("errors")
+    if not isinstance(errors, list) or not all(isinstance(item, str) for item in errors):
+        raise BridgeDeliveryUncertain(f"bridge response 'errors' is not a list of strings: {errors!r}")
 
     return response
 
