@@ -123,6 +123,33 @@ test('readJsonLine rejects when payload exceeds the byte cap', async () => {
   }
 });
 
+test('close() resolves promptly even while a client holds an idle connection open', async t => {
+  const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-test-'));
+  const server = await startServer({ ipcHook: '/tmp/test-window-idle', tmpdir, uid: 44,
+    createTerminal: async () => {}, logger: { info() {}, error() {} } });
+  t.after(() => fs.rmSync(tmpdir, { recursive: true, force: true }));
+
+  // Connect but never send a terminating newline and never close: this
+  // socket is never destroyed by the server (readJsonLine only settles on
+  // 'data' containing a newline, on 'end', or on 'error'), so it stays open
+  // for the lifetime of the test unless close() forcibly destroys it.
+  const idleSocket = net.createConnection(server.paths.socketPath);
+  await new Promise((resolve, reject) => {
+    idleSocket.on('connect', resolve);
+    idleSocket.on('error', reject);
+  });
+
+  const start = Date.now();
+  await Promise.race([
+    server.close(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('close() did not resolve within 2s')), 2000)),
+  ]);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 2000, `close() took too long: ${elapsed}ms`);
+
+  idleSocket.destroy();
+});
+
 test('writeJsonLine writes newline-terminated JSON and ends the socket', async () => {
   const server = net.createServer(socket => {
     writeJsonLine(socket, { version: 1, created: 0, errors: [] });

@@ -16,6 +16,7 @@ Two layers:
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -263,7 +264,19 @@ class LauncherBridgeSubprocessTests(unittest.TestCase):
 
     def _run(self, root, bin_dir, extra_env=None):
         env = dict(os.environ)
-        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        # Build a minimal PATH: the fake bin dir first (so the fake `comate`
+        # is found ahead of anything real), plus only the directories the
+        # script actually needs -- the real python3's own directory (so
+        # CLAUDE_CMD/shebang resolution keeps working) and the standard
+        # coreutils locations for basename/dirname/sed/grep/find/sort/cat/
+        # date/printf. This makes isolation independent of PATH search
+        # order rather than relying on a real comate/code binary simply not
+        # being present somewhere on the ambient PATH.
+        python3_dir = os.path.dirname(os.path.realpath(sys.executable))
+        minimal_path = os.pathsep.join(
+            dict.fromkeys([str(bin_dir), python3_dir, "/usr/bin", "/bin", "/usr/local/bin"])
+        )
+        env["PATH"] = minimal_path
         env["RESUME_AUTO_SELECT"] = "1"
         env["RESUME_FORCE_LAUNCH"] = "vscode"
         env["RESUME_PROJECTS_ROOT"] = str(root / "projects")

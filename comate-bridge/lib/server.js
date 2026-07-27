@@ -27,7 +27,10 @@ async function startServer({ ipcHook, createTerminal, logger, tmpdir, uid }) {
   fs.writeFileSync(paths.metadataPath, `${JSON.stringify(metadata)}\n`, { mode: 0o600 });
   fs.chmodSync(paths.metadataPath, 0o600);
 
+  const openSockets = new Set();
   const server = net.createServer(socket => {
+    openSockets.add(socket);
+    socket.once('close', () => openSockets.delete(socket));
     handleConnection(socket, createTerminal, logger).catch(error => {
       logger.error(`[resume-bridge] connection handler failed: ${error.message}`);
     });
@@ -44,7 +47,18 @@ async function startServer({ ipcHook, createTerminal, logger, tmpdir, uid }) {
   fs.chmodSync(paths.socketPath, 0o600);
 
   async function close() {
-    await new Promise(resolve => server.close(resolve));
+    const CLOSE_TIMEOUT_MS = 500;
+    const serverClosed = new Promise(resolve => server.close(resolve));
+    await Promise.race([
+      serverClosed,
+      new Promise(resolve => setTimeout(resolve, CLOSE_TIMEOUT_MS)),
+    ]);
+    // Any sockets still open past the grace period (e.g. an idle client that
+    // never sent a terminating newline) are destroyed so server.close()'s
+    // own callback can settle; this never touches VS Code terminals or other
+    // windows' sockets/metadata, only this server's tracked connections.
+    for (const socket of openSockets) socket.destroy();
+    await serverClosed;
     fs.rmSync(paths.socketPath, { force: true });
     fs.rmSync(paths.metadataPath, { force: true });
   }
