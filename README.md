@@ -1,28 +1,21 @@
 # resume-claude-sessions
 
-一个跨平台的 **Claude Code 会话恢复启动器**。扫描 `~/.claude/projects` 下的所有会话，按日期分组、复选勾选，然后在终端 / GUI / tmux / VSCode 里批量恢复（`claude --resume <id>`）。
+跨平台的 **Claude Code 会话恢复启动器**。扫描 `~/.claude/projects` 下的所有会话，按日期分组勾选，然后批量执行 `claude --resume <id>`：在本地终端、GUI、tmux 中打开，或通过桥接扩展直接追加为 Comate/VSCode 当前窗口的集成终端。
 
-## 特性
+核心安全承诺：**永远不会重载、复用、替换或关闭你当前的编辑器窗口，也永远不会读取、复用或关闭任何已存在的终端。**
 
-- **按日期分组**，最近一组默认勾选，复选框交互（仿 Windows GUI）
-- **自动识别运行环境**，无需手动指定：
-  - **有图形界面**（macOS / Linux 桌面，且 python3+tkinter 可用）→ 弹出**真表格 GUI 窗口**（`ttk.Treeview`）
-  - **无界面服务器**（Ubuntu / CentOS）→ **终端复选 TUI**（方向键移动、空格勾选，类似 Claude Code 选 skills）
-  - **VSCode 远程**（检测到 `TERM_PROGRAM=vscode`）→ 生成 `.vscode/tasks.json`，`Ctrl/Cmd+Shift+B` 一键开面板
-- **窗口合并控制**：相同「组」号的会话合并到一个终端窗口的多个标签页；每个会话可附加一个 `+CLI` 终端跑命令
-- **打开方式自动适配**：macOS → Terminal.app 窗口+标签页；Linux 桌面 → gnome-terminal/konsole；无界面 → tmux；再不行顺序运行
-- **零重型依赖**：只用各平台自带的 `bash` / `osascript` / `zenity` / `tmux` / `python3-tk`
+## 目录
 
-## 文件
+- [快速开始](#快速开始)
+- [选择界面](#选择界面)
+- [启动方式](#启动方式)
+- [Comate / VSCode 终端桥接](#comate--vscode-终端桥接)
+- [环境变量](#环境变量)
+- [文件结构](#文件结构)
+- [测试](#测试)
+- [已知约束](#已知约束)
 
-| 文件 | 说明 |
-|---|---|
-| `resume-claude-sessions.sh` | Linux / macOS 主脚本（自动识别环境） |
-| `resume-gui.py` | GUI 表格选择器（tkinter，被 sh 自动调用） |
-| `resume-claude-sessions.ps1` | Windows PowerShell 版（WinForms GUI） |
-| `还原Claude会话.bat` | Windows 双击入口 |
-
-## 使用
+## 快速开始
 
 ### macOS / Linux
 
@@ -30,18 +23,18 @@
 ./resume-claude-sessions.sh
 ```
 
-有界面自动弹 GUI，无界面自动走终端复选。
+有图形界面自动弹 GUI，无界面自动走终端复选 TUI。
 
-**macOS 若要 GUI**，需要一个带可用 Tk 的 python3。系统自带的 Tk 常常过旧，建议：
+macOS 若要 GUI，需要一个带可用 Tk 的 python3（系统自带的常常过旧）：
 
 ```bash
 brew install python-tk@3.14   # 版本号对应你的 homebrew python
 ```
 
-**Ubuntu 桌面若要 GUI**：
+Ubuntu 桌面若要 GUI：
 
 ```bash
-sudo apt install python3-tk    # 或安装 zenity
+sudo apt install python3-tk
 ```
 
 ### Windows
@@ -52,100 +45,181 @@ sudo apt install python3-tk    # 或安装 zenity
 powershell -ExecutionPolicy Bypass -File resume-claude-sessions.ps1
 ```
 
-## Comate 终端桥接（VSCode / Comate 远程）
+### Comate / VSCode 远程（追加到当前窗口）
 
-在 Comate/VSCode 远程会话里，`resume-claude-sessions.sh` 会优先尝试通过一个
-本地 Unix socket 直接把要恢复的会话作为「集成终端」追加到**当前窗口**里，不
-新开窗口、不 reload、不复用（`-r`）。只有桥接不可用时才回退到固定用 `-n`
-打开一个新窗口。
-
-安装桥接扩展（不会 reload 任何窗口）：
+一次性安装并确认配对，之后每次直接运行主脚本即可：
 
 ```bash
-./scripts/install-comate-bridge.sh
-# No window is reloaded. Restart Comate naturally when convenient.
+./scripts/install-comate-bridge.sh                      # 只安装扩展，不 reload 任何窗口
+# 之后等 Comate 自然重启一次，扩展才会激活
 
-bash resume-claude-sessions.sh
+./scripts/pair-comate-bridge.sh --confirmed-current-window   # 确认当前窗口
+bash resume-claude-sessions.sh                          # 会话作为独立终端追加到该窗口
 ```
+
+## 选择界面
+
+自动识别环境，无需手动指定：
+
+| 环境 | 界面 |
+|---|---|
+| 有图形界面且 python3+tkinter 可用 | 真表格 GUI 窗口（`ttk.Treeview`） |
+| 无界面服务器 / SSH | 终端复选 TUI |
+| 非 TTY（管道、CI） | 纯文本编号输入 |
+
+会话按日期分组，最近一组默认勾选。每行可控制：是否恢复、窗口组号（相同组号合并到同一窗口的多个标签页）、是否附加一个 `+CLI` 终端跑命令。
+
+**TUI 快捷键**
+
+`↑↓` / `jk` 移动 · `←` 折叠日期组 · `→` 展开 · `f` 下翻页 · `b` 上翻页 · `[` `]` 跳日期组 · `空格` 勾选（在日期行上则整组切换）· `g` 改窗口组号 · `c` 切换 `+CLI` · `a` 全选 · `n` 全不选 · `/` 搜索路径 · `回车` 确认 · `q` 退出
+
+翻页用 `f`/`b`，因此不依赖键盘上的 PageUp/PageDown。
+
+**GUI 操作**
+
+单击「开」列勾选 · 双击行切换勾选 · 双击「组」列改窗口组号 · 单击「+CLI」列 · 双击日期行切换整组 · 空格 / 回车 / Esc
+
+## 启动方式
+
+| 环境 | 行为 |
+|---|---|
+| macOS | Terminal.app：每组一个窗口，每会话一个标签页（标签页需要辅助功能权限，否则退化为窗口） |
+| Linux 桌面 | gnome-terminal / konsole：每组一个窗口，每会话一个标签页；再退化到 xterm |
+| Comate / VSCode | 优先桥接追加到当前窗口；不可用时固定 `-n` 新开一个窗口 |
+| 无界面 + tmux | 每组一个 tmux session，每会话一个 window |
+| 都不可用 | 在当前终端顺序运行，退出一个继续下一个 |
+
+默认恢复会话时**不带** `--dangerously-skip-permissions`。只有显式设置 `RESUME_SKIP_PERMISSIONS=1` 才会加上该参数。
+
+## Comate / VSCode 终端桥接
+
+### 为什么需要桥接
+
+Comate/VSCode 的 CLI 没有「向已打开的窗口创建集成终端并注入命令」的接口（`comate --help` 只有 `-n`/`-r`/`-a`/`-g`，且 `--open-url` 明确不支持）。要自动并行拉起多个终端，只能靠扩展 API 或 `runOn: folderOpen` 任务。因此本项目提供一个本地扩展作为桥接。
+
+### 架构
+
+| 组件 | 职责 |
+|---|---|
+| `comate-bridge/` | 本地 Comate 扩展：启动时在私有目录建立一个 Unix socket，校验请求后调用 `vscode.window.createTerminal()` |
+| `bridge/comate_bridge_client.py` | Python 客户端：窗口配对、协议编码、有界超时传输、响应校验 |
+| `resume-claude-sessions.sh` | 优先走桥接，不可用时回退固定 `-n` 新窗口 |
+
+每个会话创建的都是**独立的顶层终端**（不传 `location`，不设 `presentation.group`），不是拆分/子终端。扩展绝不枚举、关闭、隐藏、重命名、复用已有终端，也不向已有终端发送任何文本。
 
 ### 用户确认的窗口配对（必须先手动确认一次）
 
-隔离测试证明：同一个窗口里新建的终端所看到的 `VSCODE_IPC_HOOK_CLI` 值并**不**
-稳定——同一窗口内不同终端的这个变量取值会不一样，所以它不能用来识别「当前
-这个窗口」。因此正常启动路径**不再**依赖 `VSCODE_IPC_HOOK_CLI` 做路由，而是
-改为一次性的、用户显式确认的「配对」：把当前**唯一存活**的桥接 socket 绑定
-到扩展主机 PID 和期望的工作区根目录上。
+隔离测试推翻了最初的设计假设：`VSCODE_IPC_HOOK_CLI` 更接近**终端级**标识，同一窗口内新建的终端会看到不同取值，因此不能用来识别「当前这个窗口」。正常启动路径**不再**依赖它做路由。
 
-在你确认当前只打开了一个 Comate/VSCode 窗口（因而只有一个存活的桥接
-socket）之后，运行：
+改为一次性、用户显式确认的配对：把当前**唯一存活**的桥接 socket 绑定到扩展主机 PID 和期望的工作区根目录。
+
+在确认当前只打开了一个 Comate/VSCode 窗口（因而只有一个存活桥接 socket）后运行：
 
 ```bash
 ./scripts/pair-comate-bridge.sh --confirmed-current-window
 ```
 
-该脚本只调用 `bridge/comate_bridge_client.py pair`，绝不调用
-comate/code、绝不打开新窗口、绝不 reload/复用窗口、绝不创建终端。确认只对
-**当前存活的扩展主机 PID** 有效：一旦该 PID 变化（例如 Comate 自然重启），
-配对自动失效，需要重新运行本脚本确认一次。
+该脚本只调用 `bridge/comate_bridge_client.py pair`，绝不调用 comate/code、绝不打开新窗口、绝不 reload/复用窗口、绝不创建终端。
 
-正常启动时，`resume-claude-sessions.sh` 只会使用这个已确认的配对：如果配对
-不存在、工作区不匹配、绑定的 PID 已经不是存活进程、绑定的 socket/身份发生了
-变化，或者当前存活的桥接 socket 数量不是恰好一个（0 个或多个都算歧义），
-则在发送任何请求之前就判定桥接不可用（退出码 2），直接回退到固定 `-n` 新
-窗口，绝不猜测或尝试其它 socket。
+配对记录写在 `/tmp/resume-claude-sessions-$UID/paired-window.json`（权限 `0600`，位于权限 `0700` 的私有运行时目录内），绑定四项：socket 身份、socket 路径、扩展主机 PID、工作区根目录。写入使用临时文件加 `os.replace`，避免读到半成品。
 
-行为总结：
+### 运行时行为
 
-- **桥接可用**（存在有效的已确认配对）：把每个选中的会话作为独立终端追加到
-  已配对的窗口，该窗口已有的终端、编辑器、其它窗口状态**一律不会被修改**。
-- **桥接不可用**（未运行过 `pair-comate-bridge.sh`、配对已失效、扩展未安装/
-  未激活等）：回退到固定 `-n` 打开一个新窗口，根目录为 `penghaotian`（或
-  `RESUME_VSCODE_FOLDER` 指定的目录），任务通过 `runOn: folderOpen` 自动并行
-  启动；**绝不**使用 `-r`/`--reuse-window`/reload 当前窗口。
-- 无论走哪条路径，**已存在的终端永远不会被读取、复用或关闭**——桥接只调用
-  `vscode.window.createTerminal(...)` 新建终端，回退路径只写一个全新覆盖的
-  `.code-workspace` 文件。
-- `RESUME_SKIP_PERMISSIONS=1` 仍然是**显式 opt-in**：默认恢复会话时永远不带
-  `--dangerously-skip-permissions`，只有显式设置该环境变量为 `1` 时才会加上。
-- 生成的 `resume-sessions.code-workspace` 文件**每次运行都会被整体覆盖**，
-  内容只包含窗口根目录和任务命令（会话 cwd、`claude --resume <id>` 命令），
-  **不包含任何密钥**；已加入 `.gitignore`，不会被提交。
+**桥接可用**（存在有效的已确认配对）：把每个选中的会话作为独立终端追加到已配对窗口。该窗口已有的终端、编辑器和其它窗口状态一律不变。
+
+**桥接不可用**：在发送任何字节之前就判定为不可用（退出码 2），回退到固定 `-n` 打开一个新窗口，根目录为 `penghaotian`（或 `RESUME_VSCODE_FOLDER`），任务通过 `runOn: folderOpen` 自动并行启动。以下情形都算不可用，一律 fail closed，绝不猜测其它 socket：
+
+- 没运行过 `pair-comate-bridge.sh`，或配对文件损坏 / 版本不符
+- 工作区根目录与配对记录不一致
+- 绑定的 PID 已不是存活进程（例如 Comate 重启）
+- 绑定的 socket 路径或身份发生变化，或元数据权限/版本/身份校验失败
+- 当前存活的桥接 socket 数量不是恰好一个（0 个或多个都算歧义）
+
+**发送之后不再回退**：一旦请求字节可能已经送达，客户端绝不重发，脚本也绝不新开窗口，以免产生重复终端。
+
+| 退出码 | 含义 | 脚本动作 |
+|---|---|---|
+| 0 | 桥接成功 | 结束 |
+| 2 | 发送前即判定不可用 | 回退固定 `-n` 新窗口 |
+| 3 | 投递状态不确定 | 不回退，报错退出 |
+| 4 | 桥接报告了终端创建错误 | 不回退，报错退出 |
+| 其它 | 客户端内部错误 | 不回退，报错退出 |
+
+### 协议与限制
+
+请求为一行 JSON，回复亦为一行 JSON。限制：单请求 ≤ 1 MiB；单请求 ≤ 100 个终端；`cwd` 必须是存在的绝对目录；`name`/`cwd`/`command` 必须是不含 NUL 的字符串；连接与读取超时有界；版本不符视为桥接失败。命令通过 `shlex.join` 安全引用，shell 侧只传 NUL 分隔记录，不手工拼 JSON。
+
+### 安装
+
+```bash
+./scripts/install-comate-bridge.sh
+```
+
+只执行 `--install-extension <vsix> --force`，绝不执行 `-n`、`-r`、`--reuse-window`、reload 或替换工作区。安装完成后扩展要等你**下一次自然重启 Comate** 才会激活；在那之前脚本会走安全的新窗口回退。
+
+VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定时间戳、排序条目、闭合白名单），不包含测试、socket、元数据或用户设置；产物在 `dist/`，已忽略不提交。
 
 ### 隔离集成测试
 
-`scripts/test-comate-bridge-window.sh` 用于手工验证桥接在**全新窗口**里确实
-可用，绝不会碰当前调用它的窗口：它记录并排除当前窗口的 socket 身份，只用
-`comate -n <临时目录>` 打开一个新窗口，等待恰好一个新的桥接 socket 出现后
-发送一次测试请求（两个独立终端），然后让新窗口保持打开供人工检查——**该脚本
-不会自动关闭任何窗口**。
+`scripts/test-comate-bridge-window.sh` 用于在**全新窗口**里验证桥接，绝不碰当前调用它的窗口：先记录并排除当前窗口的 socket 身份，只用 `comate -n <临时目录>` 打开一个新窗口，等待恰好出现一个新桥接 socket，发送一次测试请求创建两个无害终端，自动比对终端上报的 IPC 哈希与目标 socket 身份，然后让新窗口保持打开供人工检查。**该脚本不会关闭任何窗口，无论校验结果如何。**
 
-必须带上明确的确认标志才会运行：
+必须带明确确认标志：
 
 ```bash
 ./scripts/test-comate-bridge-window.sh --i-understand-this-opens-a-new-test-window
 ```
 
-该脚本内部使用的显式 `--socket` 覆盖（配合 `--test-mode`，且路径必须位于当前
-用户的私有运行时目录下）仅供这个隔离测试脚本使用，正常的
-`resume-claude-sessions.sh` 启动流程永远不会暴露或使用这个覆盖参数。
+脚本内部使用的 `--socket` 覆盖需同时带 `--test-mode`，且路径必须位于当前用户的私有运行时目录下；测试专用的 `test` 记录类型默认被拒绝，只有 `send-input0 --test-mode` 才可能构造。正常启动流程永远不会传这些参数，也无法触达这些能力。
 
-## 环境变量（测试 / 覆盖）
+## 环境变量
 
 | 变量 | 作用 |
 |---|---|
+| `RESUME_PROJECTS_ROOT=<dir>` | 会话扫描根目录（默认 `~/.claude/projects`） |
+| `RESUME_SKIP_PERMISSIONS=1` | 显式启用 `--dangerously-skip-permissions`（默认关闭） |
 | `RESUME_FORCE_SELECT=gui\|tui` | 强制选择界面类型 |
-| `RESUME_FORCE_LAUNCH=terminal\|vscode\|tmux\|seq` | 强制打开方式 |
+| `RESUME_FORCE_LAUNCH=terminal\|vscode\|tmux\|seq` | 强制启动方式 |
 | `RESUME_PYBIN=/path/to/python` | 指定用于 GUI 的 python |
 | `RESUME_AUTO_SELECT=1` | 不弹界面，直接用默认勾选 |
 | `RESUME_DRY_RUN=1` | 只打印将要恢复的会话，不真正启动 |
+| `RESUME_VSCODE_FOLDER=<dir>` | 配对校验与新窗口回退使用的工作区根目录 |
+| `BRIDGE_TEST_POLL_SECONDS=<n>` | 隔离测试等待新 socket 的秒数（默认 20） |
+| `BRIDGE_TEST_IPC_POLL_SECONDS=<n>` | 隔离测试等待终端上报 IPC 的秒数（默认 20） |
 
-## TUI 快捷键
+## 文件结构
 
-`↑↓` / `jk` 移动 · `空格` 勾选 · `g` 改窗口组 · `c` 加 CLI · `a` 全选 · `n` 全不选 · `[` `]` 跳日期组 · `/` 搜索路径 · `回车` 确认 · `q` 退出
+| 路径 | 说明 |
+|---|---|
+| `resume-claude-sessions.sh` | Linux / macOS 主脚本，自动识别环境 |
+| `resume-gui.py` | GUI 表格选择器（tkinter，被主脚本自动调用） |
+| `resume-claude-sessions.ps1` | Windows PowerShell 版（WinForms GUI） |
+| `还原Claude会话.bat` | Windows 双击入口 |
+| `comate-bridge/` | Comate 桥接扩展：`extension.js` 与 `lib/{identity,protocol,server}.js` |
+| `bridge/comate_bridge_client.py` | Python 桥接客户端与 CLI |
+| `scripts/package-comate-bridge.py` | 确定性 VSIX 打包 |
+| `scripts/install-comate-bridge.sh` | 只安装、不 reload 的安装器 |
+| `scripts/pair-comate-bridge.sh` | 一次性窗口确认配对 |
+| `scripts/test-comate-bridge-window.sh` | 带守卫的隔离新窗口集成测试 |
+| `tests/` | Python 单元与子进程测试 |
+| `docs/superpowers/specs/` · `docs/superpowers/plans/` | 设计文档（含配对方案附录）与实施计划 |
 
-## GUI 操作
+## 测试
 
-单击「开」列勾选 · 双击行切换勾选 · 双击「组」列改窗口组号 · 单击「+CLI」列 · 双击日期行切换整组 · 空格 / 回车 / Esc
+```bash
+npm --prefix comate-bridge test          # 15 个 Node 测试
+python3 -m unittest discover -s tests    # 95 个 Python 测试
+bash -n resume-claude-sessions.sh scripts/*.sh
+```
+
+全部为离线测试：使用临时假 socket、假 CLI 与源码断言，不会调用真实 Comate、不安装扩展、不打开或关闭窗口。源码断言会检查代码里不存在 `-r`、`--reuse-window`、reload 命令，以及任何操作已有终端的调用。
+
+## 已知约束
+
+- **Comate 重启后需重新配对**：扩展主机 PID 变化会让配对自动失效，重新运行一次 `./scripts/pair-comate-bridge.sh --confirmed-current-window` 即可。
+- **同时打开第二个带桥接的窗口会暂时禁用配对快路径**：存活 socket 不唯一即视为歧义，按设计 fail closed，此时走新窗口回退。
+- **PID 复用**：存活性用信号 0 检测，只能证明该 PID 存在，理论上存在 PID 复用的窄窗口；任一其它绑定字段不符仍会拒绝。
+- **生成的 `resume-sessions.code-workspace` 每次运行整体覆盖**，只含窗口根目录与任务命令（会话 cwd、`claude --resume <id>`），不含密钥；已忽略不提交。
+- 会话 ID 会像原有启动器那样出现在进程命令行中。
 
 ## License
 
