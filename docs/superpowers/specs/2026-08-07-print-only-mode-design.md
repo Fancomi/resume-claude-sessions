@@ -126,10 +126,15 @@ expansions are switched to call it. Same semantics, one implementation.
 
 Before printing, `launch_print` writes a one-line hint to the tty (not to
 `stdout`) telling the user to paste the lines one at a time into the terminals
-they want. When fd 1 is a tty it first clears the screen, so the TUI's leftover
-frame does not sit interleaved with the commands the user is about to copy. When
-there is no tty (UI fell back to stderr) it skips the clear and only writes the
-hint.
+they want.
+
+The screen is cleared first only when the full-screen TUI actually drew — that
+is the one case where a leftover frame would sit interleaved with the commands
+being copied. `select_tui` sets a `TUI_DREW=1` flag for this purpose. The GUI
+picker (separate window), the plain non-TTY fallback (whose scrollback the user
+may still want), and `RESUME_AUTO_SELECT=1` (which draws nothing, and where
+clearing an automated caller's screen would be hostile) never clear. When fd 1
+is not a tty the clear is skipped regardless.
 
 ## Testing
 

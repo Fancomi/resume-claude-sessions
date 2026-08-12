@@ -1,6 +1,6 @@
 # resume-claude-sessions
 
-跨平台的 **Claude Code 会话恢复启动器**。扫描 `~/.claude/projects` 下的所有会话，按日期分组勾选，然后批量执行 `claude --resume <id>`：在本地终端、GUI、tmux 中打开，或通过桥接扩展直接追加为 Comate/VSCode 当前窗口的集成终端。
+跨平台的 **Claude Code 会话恢复启动器**。扫描 `~/.claude/projects` 下的所有会话，按日期分组勾选，然后批量执行 `claude --resume <id>`：在本地终端、GUI、tmux 中打开，或通过桥接扩展直接追加为 Comate/VSCode 当前窗口的集成终端。也可以什么都不启动，[只打印可粘贴的命令](#只打印命令不启动print)，由你自己贴到想用的终端里。
 
 核心安全承诺：**永远不会重载、复用、替换或关闭你当前的编辑器窗口，也永远不会读取、复用或关闭任何已存在的终端。**
 
@@ -9,6 +9,7 @@
 - [快速开始](#快速开始)
 - [选择界面](#选择界面)
 - [启动方式](#启动方式)
+  - [只打印命令，不启动（print）](#只打印命令不启动print)
 - [Comate / VSCode 终端桥接](#comate--vscode-终端桥接)
 - [环境变量](#环境变量)
 - [文件结构](#文件结构)
@@ -57,6 +58,12 @@ powershell -ExecutionPolicy Bypass -File resume-claude-sessions.ps1
 bash resume-claude-sessions.sh                          # 会话作为独立终端追加到该窗口
 ```
 
+不想装扩展、或者只想把会话贴进已经开着的终端，用 `RESUME_FORCE_LAUNCH=print`：
+
+```bash
+RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh
+```
+
 ## 选择界面
 
 自动识别环境，无需手动指定：
@@ -88,8 +95,41 @@ bash resume-claude-sessions.sh                          # 会话作为独立终�
 | Comate / VSCode | 优先桥接追加到当前窗口；不可用时固定 `-n` 新开一个窗口 |
 | 无界面 + tmux | 每组一个 tmux session，每会话一个 window |
 | 都不可用 | 在当前终端顺序运行，退出一个继续下一个 |
+| `print`（需显式指定） | 什么都不启动，只打印可粘贴的命令，见下节 |
 
 默认恢复会话时**不带** `--dangerously-skip-permissions`。只有显式设置 `RESUME_SKIP_PERMISSIONS=1` 才会加上该参数。
+
+### 只打印命令，不启动（`print`）
+
+想让会话落在**已经开着的终端**里时用这个模式。VSCode/Comate 除了桥接之外没有办法把终端追加到现有窗口，而新窗口回退往往不是你要的；这里干脆把"搬运"交给你自己：照常勾选，然后每个会话打印一条可直接粘贴的命令，脚本本身不启动任何东西。
+
+```bash
+RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh
+```
+
+输出每条两行——一行注释标明组号/会话/时间，一行命令；勾了 `+CLI` 的会话紧跟一条只 `cd` 的命令（你已经在 shell 里了，不需要 `exec`）：
+
+```text
+# G0  resume: penghaotian [08-12 20:42]
+cd '/root/paddlejob/workspace/env_run/penghaotian' && claude --resume 3f2a…c1
+
+# G0  cli: penghaotian
+cd '/root/paddlejob/workspace/env_run/penghaotian'
+
+# G1  resume: tools [08-11 22:14]
+cd '/root/.../tools' && claude --resume 91be…7d
+```
+
+`Gn` 组号照常生效，只是不再合并窗口，而是决定打印顺序——同一组的命令相邻，方便你把它们粘到同一个窗口的几个标签页里。
+
+只有命令进 stdout，选择界面走 `/dev/tty`（没有控制终端时退到 stderr），所以重定向和管道都是干净的、无 ANSI 转义的：
+
+```bash
+RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh > cmds.txt
+RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh | xclip -selection clipboard
+```
+
+该模式**只能显式指定**，绝不会被自动探测选中。与 `RESUME_DRY_RUN=1` 同时使用时 dry-run 优先，且其摘要会打到终端而非 stdout——dry-run 是调试开关，两者组合不是支持的用法。
 
 ## Comate / VSCode 终端桥接
 
@@ -178,7 +218,7 @@ VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定
 | `RESUME_PROJECTS_ROOT=<dir>` | 会话扫描根目录（默认 `~/.claude/projects`） |
 | `RESUME_SKIP_PERMISSIONS=1` | 显式启用 `--dangerously-skip-permissions`（默认关闭） |
 | `RESUME_FORCE_SELECT=gui\|tui` | 强制选择界面类型 |
-| `RESUME_FORCE_LAUNCH=terminal\|vscode\|tmux\|seq` | 强制启动方式 |
+| `RESUME_FORCE_LAUNCH=terminal\|vscode\|tmux\|seq\|print` | 强制启动方式（[`print` = 只打印命令不启动](#只打印命令不启动print)） |
 | `RESUME_PYBIN=/path/to/python` | 指定用于 GUI 的 python |
 | `RESUME_AUTO_SELECT=1` | 不弹界面，直接用默认勾选 |
 | `RESUME_DRY_RUN=1` | 只打印将要恢复的会话，不真正启动 |
@@ -207,7 +247,7 @@ VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定
 
 ```bash
 npm --prefix comate-bridge test          # 15 个 Node 测试
-python3 -m unittest discover -s tests    # 95 个 Python 测试
+python3 -m unittest discover -s tests    # 107 个 Python 测试
 bash -n resume-claude-sessions.sh scripts/*.sh
 ```
 

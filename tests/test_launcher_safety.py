@@ -13,12 +13,14 @@ Two layers:
    invoked; VSCODE_IPC_HOOK_CLI is only ever pointed at a harmless temp path.
 """
 
+import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -209,14 +211,22 @@ FAKE_COMATE_TEMPLATE = textwrap.dedent(
 )
 
 
-class LauncherBridgeSubprocessTests(unittest.TestCase):
-    """Runs the real shell script against fake bridge client + fake Comate CLI.
+class LauncherSandboxMixin:
+    """Builds a throwaway copy of the launcher with every external edge faked.
 
-    Never invokes the real Comate/code CLI, never connects to a real
-    VSCODE_IPC_HOOK_CLI socket, never opens/reloads/reuses a window.
+    Shared by the bridge tests and the print-mode tests. Nothing here touches
+    the real Comate/code CLI, the real bridge client, the real `claude`, the
+    real ~/.claude/projects, or a real VSCODE_IPC_HOOK_CLI socket.
+
+    ``sessions`` is a list of (dir_name, age_days) pairs. Each becomes one
+    .jsonl session file whose mtime is backdated by that many days, which is
+    what the launcher groups by: distinct ages mean distinct date groups, and
+    only the newest date is checked by RESUME_AUTO_SELECT=1.
     """
 
-    def _make_sandbox(self, probe_exit, send_exit):
+    DEFAULT_SESSIONS = (("work", 0),)
+
+    def _make_sandbox(self, probe_exit=0, send_exit=0, sessions=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -249,20 +259,33 @@ class LauncherBridgeSubprocessTests(unittest.TestCase):
         fake_claude.write_text("#!/usr/bin/env bash\necho fake-claude \"$@\"\n")
         fake_claude.chmod(0o755)
 
-        # A fake project dir with a minimal session so the launcher has >=1
+        # Fake project dirs with minimal sessions so the launcher has >=1
         # session to select via RESUME_AUTO_SELECT=1, without touching the
         # real ~/.claude/projects.
         projects_root = root / "projects"
         proj_dir = projects_root / "proj"
         proj_dir.mkdir(parents=True)
-        work_cwd = root / "work"
-        work_cwd.mkdir()
-        session_file = proj_dir / "11111111-1111-1111-1111-111111111111.jsonl"
-        session_file.write_text('{"cwd": "%s"}\n' % str(work_cwd))
+        self.session_info = []
+        for n, (dir_name, age_days) in enumerate(sessions or self.DEFAULT_SESSIONS, start=1):
+            work_cwd = root / dir_name
+            work_cwd.mkdir()
+            session_id = str(n) * 8 + "-" + "-".join([str(n) * 4] * 3) + "-" + str(n) * 12
+            session_file = proj_dir / (session_id + ".jsonl")
+            session_file.write_text('{"cwd": "%s"}\n' % str(work_cwd))
+            mtime = time.time() - age_days * 86400
+            os.utime(session_file, (mtime, mtime))
+            self.session_info.append(
+                {
+                    "id": session_id,
+                    "cwd": str(work_cwd),
+                    "name": dir_name,
+                    "time": time.strftime("%m-%d %H:%M", time.localtime(mtime)),
+                }
+            )
 
         return root, bridge_record, comate_record, bin_dir
 
-    def _run(self, root, bin_dir, extra_env=None):
+    def _run(self, root, bin_dir, extra_env=None, stdin=None):
         env = dict(os.environ)
         # Build a minimal PATH: the fake bin dir first (so the fake `comate`
         # is found ahead of anything real), plus only the directories the
@@ -286,16 +309,28 @@ class LauncherBridgeSubprocessTests(unittest.TestCase):
         # remote-cli binary.
         env.pop("VSCODE_GIT_ASKPASS_NODE", None)
         if extra_env:
-            env.update(extra_env)
+            env.update({k: v for k, v in extra_env.items() if v is not None})
+            for k, v in extra_env.items():
+                if v is None:
+                    env.pop(k, None)
         result = subprocess.run(
             ["bash", str(root / "resume-claude-sessions.sh")],
             cwd=root,
             env=env,
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=30,
         )
         return result
+
+
+class LauncherBridgeSubprocessTests(LauncherSandboxMixin, unittest.TestCase):
+    """Runs the real shell script against fake bridge client + fake Comate CLI.
+
+    Never invokes the real Comate/code CLI, never connects to a real
+    VSCODE_IPC_HOOK_CLI socket, never opens/reloads/reuses a window.
+    """
 
     def test_bridge_success_never_invokes_comate_cli(self):
         root, bridge_record, comate_record, bin_dir = self._make_sandbox(probe_exit=0, send_exit=0)
@@ -351,6 +386,168 @@ class LauncherBridgeSubprocessTests(unittest.TestCase):
         data = bridge_record.read_bytes()
         fields = data[:-1].decode("utf-8").split("\0")
         self.assertIn("1", fields)
+
+    def test_fallback_workspace_is_valid_json_for_a_quoted_cwd(self):
+        # The new-window fallback shares shquote() with print mode. A cwd
+        # containing a single quote must still produce a parseable workspace
+        # file whose task command re-quotes the path correctly.
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox(
+            probe_exit=2, send_exit=0, sessions=(("it's work", 0),)
+        )
+        result = self._run(root, bin_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        doc = json.loads((root / "resume-sessions.code-workspace").read_text())
+        cmd = doc["tasks"]["tasks"][0]["command"]
+        self.assertIn("'%s'" % self.session_info[0]["cwd"].replace("'", "'\\''"), cmd)
+
+
+class PrintModeSourceTests(unittest.TestCase):
+    """Source-level checks: print mode launches nothing at all."""
+
+    def setUp(self):
+        self.source = SOURCE_PATH.read_text()
+
+    def test_dispatcher_has_a_print_arm(self):
+        idx = self.source.index('case "$LAUNCH_MODE" in')
+        body = self.source[idx:]
+        self.assertIn("print)", body)
+        self.assertIn("launch_print", body)
+
+    def test_print_mode_is_never_auto_detected(self):
+        # detect_launch() must not be able to return "print" on its own; the
+        # only way in is an explicit RESUME_FORCE_LAUNCH=print.
+        idx = self.source.index("detect_launch() {")
+        body = self.source[idx : self.source.index("\n}\n", idx)]
+        self.assertNotIn("print", body)
+
+    def test_launch_print_invokes_no_launcher(self):
+        idx = self.source.index("launch_print() {")
+        body = self.source[idx : self.source.index("\n}\n", idx)]
+        for forbidden in [
+            "launch_vscode_bridge",
+            "launch_vscode_new_window",
+            "tmux",
+            "osascript",
+            "gnome-terminal",
+            "konsole",
+            "code-workspace",
+        ]:
+            self.assertNotIn(forbidden, body)
+
+
+class LauncherPrintModeTests(LauncherSandboxMixin, unittest.TestCase):
+    """print mode must emit paste-ready commands and launch absolutely nothing."""
+
+    PRINT_ENV = {"RESUME_FORCE_LAUNCH": "print"}
+
+    def _claude(self, bin_dir):
+        return str(bin_dir / "claude")
+
+    def test_stdout_is_exactly_the_command_block(self):
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox()
+        result = self._run(root, bin_dir, extra_env=self.PRINT_ENV)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        s = self.session_info[0]
+        expected = (
+            "# G0  resume: %s [%s]\n" % (s["name"], s["time"])
+            + "cd '%s' && %s --resume %s\n" % (s["cwd"], self._claude(bin_dir), s["id"])
+        )
+        self.assertEqual(result.stdout, expected)
+
+    def test_stdout_has_no_ansi_escapes_or_trailing_whitespace(self):
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox()
+        result = self._run(root, bin_dir, extra_env=self.PRINT_ENV)
+        self.assertNotIn("\x1b", result.stdout)
+        for line in result.stdout.splitlines():
+            self.assertEqual(line, line.rstrip(), "printed line has trailing whitespace: %r" % line)
+
+    def test_nothing_is_launched(self):
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox()
+        result = self._run(root, bin_dir, extra_env=self.PRINT_ENV)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertFalse(bridge_record.exists(), "print mode must never contact the bridge client")
+        self.assertFalse(comate_record.exists(), "print mode must never invoke the Comate/VSCode CLI")
+        self.assertFalse(
+            (root / "resume-sessions.code-workspace").exists(),
+            "print mode must never write the workspace file",
+        )
+
+    def test_default_command_omits_dangerous_flag(self):
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox()
+        result = self._run(root, bin_dir, extra_env=self.PRINT_ENV)
+        self.assertNotIn("--dangerously-skip-permissions", result.stdout)
+
+    def test_skip_permissions_env_appears_in_printed_command(self):
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox()
+        env = dict(self.PRINT_ENV, RESUME_SKIP_PERMISSIONS="1")
+        result = self._run(root, bin_dir, extra_env=env)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        s = self.session_info[0]
+        self.assertIn(
+            "cd '%s' && %s --resume %s --dangerously-skip-permissions"
+            % (s["cwd"], self._claude(bin_dir), s["id"]),
+            result.stdout,
+        )
+
+    def test_groups_and_cli_tabs_order_the_printed_block(self):
+        # Drive the plain (non-TTY) picker instead of RESUME_AUTO_SELECT so
+        # more than one window group is reachable: session 1 is today (group
+        # 0, checked by default), session 2 is yesterday (group 1, off). Turn
+        # session 2 on, add a +CLI entry to session 1, then confirm. The
+        # printed block must group by Gn, and a session's cli command must
+        # directly follow its own resume command.
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox(
+            sessions=(("s-new", 0), ("s-old", 1))
+        )
+        env = dict(self.PRINT_ENV, RESUME_AUTO_SELECT=None, RESUME_FORCE_SELECT="tui")
+        result = self._run(root, bin_dir, extra_env=env, stdin="2\nc1\n\n")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        new, old = self.session_info
+        claude = self._claude(bin_dir)
+        expected = (
+            "# G0  resume: %s [%s]\n" % (new["name"], new["time"])
+            + "cd '%s' && %s --resume %s\n" % (new["cwd"], claude, new["id"])
+            + "\n"
+            + "# G0  cli: %s\n" % new["name"]
+            + "cd '%s'\n" % new["cwd"]
+            + "\n"
+            + "# G1  resume: %s [%s]\n" % (old["name"], old["time"])
+            + "cd '%s' && %s --resume %s\n" % (old["cwd"], claude, old["id"])
+        )
+        self.assertEqual(result.stdout, expected)
+
+    def test_picker_ui_never_pollutes_stdout(self):
+        # Same plain-picker run as above: every prompt, header and hint the
+        # picker writes must land off stdout (tty when there is one, stderr
+        # otherwise), so `> cmds.txt` stays paste-ready.
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox(
+            sessions=(("s-new", 0), ("s-old", 1))
+        )
+        env = dict(self.PRINT_ENV, RESUME_AUTO_SELECT=None, RESUME_FORCE_SELECT="tui")
+        result = self._run(root, bin_dir, extra_env=env, stdin="2\nc1\n\n")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertNotIn("Claude 会话", result.stdout)
+        self.assertNotIn("> ", result.stdout)
+        self.assertIn("Claude 会话", result.stderr)
+
+    def test_cwd_with_single_quote_is_safely_quoted(self):
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox(
+            sessions=(("it's work", 0),)
+        )
+        result = self._run(root, bin_dir, extra_env=self.PRINT_ENV)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        cmd = [l for l in result.stdout.splitlines() if l.startswith("cd ")][0]
+        quoted = cmd.split(" && ", 1)[0][len("cd ") :]
+        # The printed line must survive a real shell round-trip back to the
+        # original path, rather than merely containing it somewhere.
+        probe = subprocess.run(
+            ["bash", "-c", "eval \"printf '%s' $QUOTED\""],
+            env={"QUOTED": quoted, "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(probe.returncode, 0, msg=probe.stderr)
+        self.assertEqual(probe.stdout, self.session_info[0]["cwd"])
 
 
 if __name__ == "__main__":

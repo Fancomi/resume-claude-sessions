@@ -21,8 +21,14 @@
 #   * headless-> tmux: one SESSION per group, one WINDOW per session (+CLI win).
 #                No tmux -> sequential in this terminal.
 #
+# Launch nothing, just print (opt-in only, never auto-detected):
+#   RESUME_FORCE_LAUNCH=print — pick sessions as usual, then print one
+#   paste-ready command per session on stdout (grouped by Gn) and launch
+#   nothing. For when you want the sessions in terminals you already have open.
+#   The picker draws on /dev/tty, so `> cmds.txt` / `| xclip` stay clean.
+#
 # Test/override:
-#   RESUME_FORCE_LAUNCH=terminal|vscode|tmux|seq   RESUME_DRY_RUN=1
+#   RESUME_FORCE_LAUNCH=terminal|vscode|tmux|seq|print   RESUME_DRY_RUN=1
 #   RESUME_AUTO_SELECT=1 (take defaults, no prompt)
 # NOTE: no `set -e` here. This script is written throughout in the
 # `[ cond ] && action` idiom (move(), case arms, launch loops); under errexit a
@@ -46,6 +52,7 @@ GUI_HELPER="$SCRIPT_DIR/resume-gui.py"
 [ -d "$PROJECTS_ROOT" ] || { echo "Projects dir not found: $PROJECTS_ROOT" >&2; exit 1; }
 
 # --- portable helpers --------------------------------------------------------
+shquote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }   # single-quote for eval/paste
 mtime_epoch() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null; }
 first_cwd() {
   grep -m1 -o '"cwd"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" 2>/dev/null \
@@ -110,6 +117,19 @@ detect_launch() {
   echo "seq"
 }
 LAUNCH_MODE="$(detect_launch)"
+
+# print mode reserves stdout for the commands themselves, so `> cmds.txt` and
+# `| xclip` yield a clean paste-ready file. Everything the picker draws goes to
+# the controlling terminal instead. Moving fd 1 wholesale (rather than editing
+# every printf in the selection code) keeps the picker untouched; launch_print
+# writes to fd 3, which still points at the real stdout.
+# The `: >/dev/tty` probe must run BEFORE the exec: a failing `exec`
+# redirection kills a non-interactive shell outright. With no controlling
+# terminal the UI falls back to stderr and stdout stays clean either way.
+if [ "$LAUNCH_MODE" = "print" ]; then
+  exec 3>&1
+  if { : >/dev/tty; } 2>/dev/null; then exec 1>/dev/tty; else exec 1>&2; fi
+fi
 # ============================ SELECTION (checkbox TUI) =======================
 # rows[] maps visual row -> session index, or "H:<date>" for a date header.
 # Collapsed dates hide their session rows (tree fold). ←/→ toggle the fold.
@@ -190,6 +210,8 @@ toggle_date_group() {          # select-all / deselect-all for a date
   for ((i=0;i<total;i++)); do [ "${sel_date[$i]}" = "$d" ] && sel_checked[$i]="$tgt"; done
 }
 
+TUI_DREW=0      # set by select_tui; launch_print clears the screen only if the
+                # full-screen picker actually drew a frame over it.
 select_tui() {
   [ -t 0 ] && [ -t 1 ] || { select_plain; return; }
   local cur=1 key rest r si off=0
@@ -197,6 +219,7 @@ select_tui() {
   for ((r=0;r<nrows;r++)); do case "${rows[$r]}" in H:*) ;; *) cur=$r; break;; esac; done
   tput civis 2>/dev/null || true
   printf '\033[2J'                            # one full clear up front; draw() is incremental after
+  TUI_DREW=1
   trap 'tput cnorm 2>/dev/null || true' RETURN
 
   term_rows() { local n; n="$(tput lines 2>/dev/null || echo 24)"; [ "$n" -ge 6 ] || n=24; echo "$n"; }
@@ -482,6 +505,46 @@ launch_seq() {
   done
 }
 
+# --- print: launch nothing, emit paste-ready commands on fd 3 ----------------
+# For when the sessions belong in terminals you already have open — VSCode
+# offers no way to attach one there without the Comate bridge, and the
+# new-window fallback is often not what you want.
+#
+# Commands go to fd 3 (the real stdout, saved before fd 1 was pointed at the
+# tty); the hint goes to fd 1 so it never lands in a redirected file. Ordering
+# mirrors what the other launchers would have built: group by group, and a
+# session's +CLI command immediately after its own resume command.
+launch_print() {
+  local g i cmd first=1
+  # Only the full-screen TUI leaves a frame worth erasing. The GUI picker owns a
+  # separate window, the plain picker's scrollback may still be wanted, and
+  # RESUME_AUTO_SELECT draws nothing at all — clearing an automated caller's
+  # screen would be hostile.
+  [ "$TUI_DREW" = "1" ] && [ -t 1 ] && printf '\033[2J\033[H'
+  echo "以下命令逐条复制，粘贴到你想用的终端里执行（相同 G 号原本会合并到一个窗口）："
+  echo
+  for g in $chosen_groups; do
+    for i in "${chosen_idx[@]}"; do
+      [ "${sel_group[$i]}" = "$g" ] || continue
+      # resume_cmd ends in an interpolated $RESUME_FLAGS, which leaves one
+      # trailing space when that is empty (the default); strip it so no
+      # printed line ends in whitespace.
+      cmd="$(resume_cmd "$i")"; cmd="${cmd% }"
+      [ "$first" = "1" ] || printf '\n' >&3
+      printf '# G%s  resume: %s [%s]\n' "$g" "${sel_name[$i]}" "${sel_time[$i]}" >&3
+      printf 'cd %s && %s\n' "$(shquote "${sel_cwd[$i]}")" "$cmd" >&3
+      first=0
+      # A bare cd: the user is already sitting in the shell they pasted into,
+      # so there is nothing to exec.
+      if [ "${sel_cli[$i]}" = "1" ]; then
+        printf '\n' >&3
+        printf '# G%s  cli: %s\n' "$g" "${sel_name[$i]}" >&3
+        printf 'cd %s\n' "$(shquote "${sel_cwd[$i]}")" >&3
+      fi
+    done
+  done
+}
+
 # --- VSCode: exact-window bridge first, fixed-new-window as the only fallback
 # Two independent paths, tried in order:
 #
@@ -587,9 +650,9 @@ launch_vscode_new_window() {
   }
   for i in "${chosen_idx[@]}"; do
     label="resume: ${sel_name[$i]} [${sel_time[$i]}]"
-    cmd="cd '${sel_cwd[$i]//\'/\'\\\'\'}' && $(resume_cmd "$i")"
+    cmd="cd $(shquote "${sel_cwd[$i]}") && $(resume_cmd "$i")"
     add_task "$label" "$cmd"
-    [ "${sel_cli[$i]}" = "1" ] && add_task "cli: ${sel_name[$i]}" "cd '${sel_cwd[$i]//\'/\'\\\'\'}' && exec \$SHELL"
+    [ "${sel_cli[$i]}" = "1" ] && add_task "cli: ${sel_name[$i]}" "cd $(shquote "${sel_cwd[$i]}") && exec \$SHELL"
   done
 
   # Overwrite each run. Window root = $folder; tasks live inline in the workspace
@@ -637,6 +700,7 @@ case "$LAUNCH_MODE" in
   vscode)   launch_vscode ;;
   terminal) [ "$UNAME" = "Darwin" ] && launch_terminal_mac || launch_terminal_linux ;;
   tmux)     launch_tmux ;;
+  print)    launch_print ;;
   seq)      launch_seq ;;
   *)        launch_seq ;;
 esac
