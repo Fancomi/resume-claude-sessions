@@ -5,14 +5,17 @@
 Add a launch mode to `resume-claude-sessions.sh` that selects sessions exactly as
 today but launches nothing. Instead it prints, one per selected session, a
 ready-to-paste shell command. The user pastes each line into whichever existing
-terminal they choose.
+terminal they choose. This becomes the script's **default** behavior; launching
+for real is opt-in via `RESUME_FORCE_LAUNCH=auto` (or a named mode).
 
 This exists because VSCode/Comate cannot attach a terminal to an already-open
 window except through the Comate bridge, which requires a confirmed pairing and
 an installed extension. When the bridge is unavailable, today's only fallback
-opens a brand-new window. Print mode makes the human the transport: no window is
-opened, no terminal is created, and the user keeps full control over where each
-session lands.
+opens a brand-new window — and every other platform's launch mode likewise
+creates new windows or tabs. Print mode makes the human the transport: no window
+is opened, no terminal is created, and the user keeps full control over where
+each session lands. Making it the default means a bare invocation can never
+spawn anything unexpected.
 
 ## Constraints
 
@@ -22,6 +25,9 @@ session lands.
   created.
 - `stdout` must carry only the commands, so `> cmds.txt` and `| xclip` produce a
   clean, paste-ready file with no ANSI escapes.
+- Because print is the default, a bare invocation must never contact the bridge
+  client, write `resume-sessions.code-workspace`, or invoke the Comate/VSCode
+  CLI — even in an environment detection would have called VSCode.
 - Permission behavior is unchanged: `--dangerously-skip-permissions` appears in
   a printed command only when `RESUME_SKIP_PERMISSIONS=1`.
 - Nothing may execute a resume command, write `resume-sessions.code-workspace`,
@@ -31,12 +37,19 @@ session lands.
 
 ## Activation
 
-`RESUME_FORCE_LAUNCH=print`.
+Print mode is the **default**. `detect_launch()` reads
+`${RESUME_FORCE_LAUNCH:-print}` and returns it verbatim unless it is the literal
+`auto`, which re-enters the platform sniffing (VSCode → Terminal.app /
+gnome-terminal → tmux → sequential) that used to be the default. Individual
+modes can still be named directly (`=tmux`, `=vscode`, …). The dispatcher
+`case "$LAUNCH_MODE"` gains a `print) launch_print ;;` arm.
 
-`detect_launch()` already returns `$RESUME_FORCE_LAUNCH` verbatim when it is
-set, so no change is needed there — `print` is never auto-detected, only
-requested. The dispatcher `case "$LAUNCH_MODE"` gains a `print) launch_print ;;`
-arm.
+Launching became opt-in because none of the launch modes can do the thing most
+often wanted — put a session into a terminal that is already open. They all
+create new terminals, windows, or tabs. Printing makes that the user's choice
+instead of the script's, and it is the one mode that cannot surprise you by
+spawning windows. `launch_print` prints a one-line reminder that
+`RESUME_FORCE_LAUNCH=auto` restores real launching.
 
 Rejected alternatives: a separate `RESUME_PRINT_ONLY=1` flag (a second,
 overlapping switch for something that is simply another launch target), and a
@@ -71,8 +84,8 @@ controlling terminal the UI falls back to stderr and `stdout` stays clean.
 Accepted consequences:
 
 - `select_tui`'s `[ -t 1 ]` guard now tests the tty rather than the original
-  stdout, so `RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh > cmds.txt`
-  still gets the full interactive TUI. This is the desired behavior.
+  stdout, so `./resume-claude-sessions.sh > cmds.txt` still gets the full
+  interactive TUI. This is the desired behavior.
 - `RESUME_DRY_RUN=1` continues to take precedence over the dispatcher, and its
   summary goes to the tty rather than to `stdout`. Dry-run is a debugging
   switch; combining it with print mode is not a supported workflow and is
@@ -150,13 +163,22 @@ fake `claude`, temp projects root) with `RESUME_FORCE_LAUNCH=print`:
   `resume-sessions.code-workspace` was not written.
 - With `RESUME_SKIP_PERMISSIONS=1` the printed command contains
   `--dangerously-skip-permissions`; without it, it does not.
+- With no `RESUME_FORCE_LAUNCH` at all, in a sandbox whose environment
+  detection would have chosen VSCode, the output is still the print block and
+  none of the launch side effects occur.
+- With `RESUME_FORCE_LAUNCH=auto`, detection is restored: the same sandbox
+  reaches the bridge client and prints no commands.
 
-A source-level assertion confirms the print dispatcher arm exists and that
+A source-level assertion confirms the print dispatcher arm exists, that
+`detect_launch()` defaults to `print` and gates detection behind `auto`, and that
 `launch_print` contains no call to `launch_vscode_bridge`,
 `launch_vscode_new_window`, `tmux`, or `osascript`.
 
 ## Documentation
 
-`README.md` gains `RESUME_FORCE_LAUNCH=print` to the environment-variable table
-and a short section showing the invocation, sample output, and the
-`> cmds.txt` / `| xclip` redirection cases.
+`README.md` documents print as the default throughout: the intro, the quickstart
+(with `RESUME_FORCE_LAUNCH=auto` for real launching), the launch-mode table
+(reframed as "what `auto` detects"), a section on the print output with the
+`> cmds.txt` / `| xclip` cases, a section on `auto`, and the environment-variable
+table. The Comate bridge sections note that the bridge is only reached on the
+VSCode launch path, not by default.

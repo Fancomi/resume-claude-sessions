@@ -400,9 +400,19 @@ class LauncherBridgeSubprocessTests(LauncherSandboxMixin, unittest.TestCase):
         cmd = doc["tasks"]["tasks"][0]["command"]
         self.assertIn("'%s'" % self.session_info[0]["cwd"].replace("'", "'\\''"), cmd)
 
+    def test_auto_restores_platform_detection_and_reaches_the_bridge(self):
+        # RESUME_FORCE_LAUNCH=auto is the opt-in back into the old
+        # platform-sniffing default. In this VSCode-looking sandbox that must
+        # land on the bridge path, not on print.
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox(probe_exit=0, send_exit=0)
+        result = self._run(root, bin_dir, extra_env={"RESUME_FORCE_LAUNCH": "auto"})
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertTrue(bridge_record.exists(), "auto must re-enable detection and reach the bridge")
+        self.assertNotIn("cd '", result.stdout)
+
 
 class PrintModeSourceTests(unittest.TestCase):
-    """Source-level checks: print mode launches nothing at all."""
+    """Source-level checks: print is the default, and it launches nothing."""
 
     def setUp(self):
         self.source = SOURCE_PATH.read_text()
@@ -413,12 +423,14 @@ class PrintModeSourceTests(unittest.TestCase):
         self.assertIn("print)", body)
         self.assertIn("launch_print", body)
 
-    def test_print_mode_is_never_auto_detected(self):
-        # detect_launch() must not be able to return "print" on its own; the
-        # only way in is an explicit RESUME_FORCE_LAUNCH=print.
+    def test_print_is_the_default_and_auto_opts_into_detection(self):
+        # Launching anything must be explicit: detect_launch() defaults to
+        # print, and the platform sniffing that used to be the default is
+        # reachable only via RESUME_FORCE_LAUNCH=auto.
         idx = self.source.index("detect_launch() {")
         body = self.source[idx : self.source.index("\n}\n", idx)]
-        self.assertNotIn("print", body)
+        self.assertIn("${RESUME_FORCE_LAUNCH:-print}", body)
+        self.assertIn('= "auto"', body)
 
     def test_launch_print_invokes_no_launcher(self):
         idx = self.source.index("launch_print() {")
@@ -442,6 +454,23 @@ class LauncherPrintModeTests(LauncherSandboxMixin, unittest.TestCase):
 
     def _claude(self, bin_dir):
         return str(bin_dir / "claude")
+
+    def test_print_is_the_default_with_no_force_launch(self):
+        # No RESUME_FORCE_LAUNCH at all, and a VSCode-looking environment that
+        # detection used to latch onto: the default must still be print, so a
+        # bare invocation never spawns terminals or windows.
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox()
+        result = self._run(root, bin_dir, extra_env={"RESUME_FORCE_LAUNCH": None})
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        s = self.session_info[0]
+        self.assertEqual(
+            result.stdout,
+            "# G0  resume: %s [%s]\n" % (s["name"], s["time"])
+            + "cd '%s' && %s --resume %s\n" % (s["cwd"], self._claude(bin_dir), s["id"]),
+        )
+        self.assertFalse(bridge_record.exists())
+        self.assertFalse(comate_record.exists())
+        self.assertFalse((root / "resume-sessions.code-workspace").exists())
 
     def test_stdout_is_exactly_the_command_block(self):
         root, bridge_record, comate_record, bin_dir = self._make_sandbox()

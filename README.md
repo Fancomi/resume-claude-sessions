@@ -1,6 +1,6 @@
 # resume-claude-sessions
 
-跨平台的 **Claude Code 会话恢复启动器**。扫描 `~/.claude/projects` 下的所有会话，按日期分组勾选，然后批量执行 `claude --resume <id>`：在本地终端、GUI、tmux 中打开，或通过桥接扩展直接追加为 Comate/VSCode 当前窗口的集成终端。也可以什么都不启动，[只打印可粘贴的命令](#只打印命令不启动print)，由你自己贴到想用的终端里。
+跨平台的 **Claude Code 会话恢复启动器**。扫描 `~/.claude/projects` 下的所有会话，按日期分组勾选，然后**默认只打印**每个会话的 `claude --resume <id>` 命令，由你自己粘贴到想用的终端里（[详见](#只打印命令不启动默认)）。加上 `RESUME_FORCE_LAUNCH=auto` 才会真的启动：在本地终端、GUI、tmux 中打开，或通过桥接扩展直接追加为 Comate/VSCode 当前窗口的集成终端。
 
 核心安全承诺：**永远不会重载、复用、替换或关闭你当前的编辑器窗口，也永远不会读取、复用或关闭任何已存在的终端。**
 
@@ -9,7 +9,8 @@
 - [快速开始](#快速开始)
 - [选择界面](#选择界面)
 - [启动方式](#启动方式)
-  - [只打印命令，不启动（print）](#只打印命令不启动print)
+  - [只打印命令，不启动（默认）](#只打印命令不启动默认)
+  - [真的要启动：RESUME_FORCE_LAUNCH=auto](#真的要启动resume_force_launchauto)
 - [Comate / VSCode 终端桥接](#comate--vscode-终端桥接)
 - [环境变量](#环境变量)
 - [文件结构](#文件结构)
@@ -24,7 +25,11 @@
 ./resume-claude-sessions.sh
 ```
 
-有图形界面自动弹 GUI，无界面自动走终端复选 TUI。
+有图形界面自动弹 GUI，无界面自动走终端复选 TUI。**默认不启动任何东西**，勾选完只打印可粘贴的命令，你自己贴到想用的终端里（详见[只打印命令](#只打印命令不启动默认)）。想让脚本直接开终端/窗口：
+
+```bash
+RESUME_FORCE_LAUNCH=auto ./resume-claude-sessions.sh
+```
 
 macOS 若要 GUI，需要一个带可用 Tk 的 python3（系统自带的常常过旧）：
 
@@ -48,20 +53,14 @@ powershell -ExecutionPolicy Bypass -File resume-claude-sessions.ps1
 
 ### Comate / VSCode 远程（追加到当前窗口）
 
-一次性安装并确认配对，之后每次直接运行主脚本即可：
+一次性安装并确认配对，之后每次带 `RESUME_FORCE_LAUNCH=auto` 运行主脚本即可：
 
 ```bash
 ./scripts/install-comate-bridge.sh                      # 只安装扩展，不 reload 任何窗口
 # 之后等 Comate 自然重启一次，扩展才会激活
 
 ./scripts/pair-comate-bridge.sh --confirmed-current-window   # 确认当前窗口
-bash resume-claude-sessions.sh                          # 会话作为独立终端追加到该窗口
-```
-
-不想装扩展、或者只想把会话贴进已经开着的终端，用 `RESUME_FORCE_LAUNCH=print`：
-
-```bash
-RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh
+RESUME_FORCE_LAUNCH=auto bash resume-claude-sessions.sh      # 会话作为独立终端追加到该窗口
 ```
 
 ## 选择界面
@@ -74,7 +73,7 @@ RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh
 | 无界面服务器 / SSH | 终端复选 TUI |
 | 非 TTY（管道、CI） | 纯文本编号输入 |
 
-会话按日期分组，最近一组默认勾选。每行可控制：是否恢复、窗口组号（相同组号合并到同一窗口的多个标签页）、是否附加一个 `+CLI` 终端跑命令。
+会话按日期分组，最近一组默认勾选。每行可控制：是否恢复、窗口组号（相同组号合并到同一窗口的多个标签页；默认的 print 模式下不合并窗口，只决定打印顺序）、是否附加一个 `+CLI` 终端跑命令。
 
 **TUI 快捷键**
 
@@ -88,23 +87,26 @@ RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh
 
 ## 启动方式
 
-| 环境 | 行为 |
+**默认什么都不启动**，只打印可粘贴的命令（见[下节](#只打印命令不启动默认)）。下表是 `RESUME_FORCE_LAUNCH=auto` 时自动识别的行为，也可以直接点名其中一种：
+
+| 环境 | `auto` 的行为 |
 |---|---|
 | macOS | Terminal.app：每组一个窗口，每会话一个标签页（标签页需要辅助功能权限，否则退化为窗口） |
 | Linux 桌面 | gnome-terminal / konsole：每组一个窗口，每会话一个标签页；再退化到 xterm |
 | Comate / VSCode | 优先桥接追加到当前窗口；不可用时固定 `-n` 新开一个窗口 |
 | 无界面 + tmux | 每组一个 tmux session，每会话一个 window |
 | 都不可用 | 在当前终端顺序运行，退出一个继续下一个 |
-| `print`（需显式指定） | 什么都不启动，只打印可粘贴的命令，见下节 |
 
 默认恢复会话时**不带** `--dangerously-skip-permissions`。只有显式设置 `RESUME_SKIP_PERMISSIONS=1` 才会加上该参数。
 
-### 只打印命令，不启动（`print`）
+### 只打印命令，不启动（默认）
 
-想让会话落在**已经开着的终端**里时用这个模式。VSCode/Comate 除了桥接之外没有办法把终端追加到现有窗口，而新窗口回退往往不是你要的；这里干脆把"搬运"交给你自己：照常勾选，然后每个会话打印一条可直接粘贴的命令，脚本本身不启动任何东西。
+**这是默认行为**，不带任何环境变量直接运行即可。
+
+想让会话落在**已经开着的终端**里——这正是所有启动方式都做不到的事：VSCode/Comate 除了桥接之外没有办法把终端追加到现有窗口，而新窗口回退往往不是你要的；其它平台的启动方式也一律是新开窗口/标签页。所以这里干脆把"搬运"交给你自己：照常勾选，然后每个会话打印一条可直接粘贴的命令，脚本本身不启动任何东西。
 
 ```bash
-RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh
+./resume-claude-sessions.sh
 ```
 
 输出每条两行——一行注释标明组号/会话/时间，一行命令；勾了 `+CLI` 的会话紧跟一条只 `cd` 的命令（你已经在 shell 里了，不需要 `exec`）：
@@ -125,11 +127,19 @@ cd '/root/.../tools' && claude --resume 91be…7d
 只有命令进 stdout，选择界面走 `/dev/tty`（没有控制终端时退到 stderr），所以重定向和管道都是干净的、无 ANSI 转义的：
 
 ```bash
-RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh > cmds.txt
-RESUME_FORCE_LAUNCH=print ./resume-claude-sessions.sh | xclip -selection clipboard
+./resume-claude-sessions.sh > cmds.txt
+./resume-claude-sessions.sh | xclip -selection clipboard
 ```
 
-该模式**只能显式指定**，绝不会被自动探测选中。与 `RESUME_DRY_RUN=1` 同时使用时 dry-run 优先，且其摘要会打到终端而非 stdout——dry-run 是调试开关，两者组合不是支持的用法。
+与 `RESUME_DRY_RUN=1` 同时使用时 dry-run 优先，且其摘要会打到终端而非 stdout——dry-run 是调试开关，两者组合不是支持的用法。
+
+### 真的要启动：`RESUME_FORCE_LAUNCH=auto`
+
+```bash
+RESUME_FORCE_LAUNCH=auto ./resume-claude-sessions.sh
+```
+
+`auto` 就是过去的默认行为：按上表自动识别环境（VSCode 桥接 / Terminal.app / gnome-terminal / tmux / 顺序执行）。也可以直接点名某一种，例如 `RESUME_FORCE_LAUNCH=tmux`。
 
 ## Comate / VSCode 终端桥接
 
@@ -143,7 +153,7 @@ Comate/VSCode 的 CLI 没有「向已打开的窗口创建集成终端并注入�
 |---|---|
 | `comate-bridge/` | 本地 Comate 扩展：启动时在私有目录建立一个 Unix socket，校验请求后调用 `vscode.window.createTerminal()` |
 | `bridge/comate_bridge_client.py` | Python 客户端：窗口配对、协议编码、有界超时传输、响应校验 |
-| `resume-claude-sessions.sh` | 优先走桥接，不可用时回退固定 `-n` 新窗口 |
+| `resume-claude-sessions.sh` | `RESUME_FORCE_LAUNCH=auto`（或 `=vscode`）时优先走桥接，不可用时回退固定 `-n` 新窗口 |
 
 每个会话创建的都是**独立的顶层终端**（不传 `location`，不设 `presentation.group`），不是拆分/子终端。扩展绝不枚举、关闭、隐藏、重命名、复用已有终端，也不向已有终端发送任何文本。
 
@@ -164,6 +174,8 @@ Comate/VSCode 的 CLI 没有「向已打开的窗口创建集成终端并注入�
 配对记录写在 `/tmp/resume-claude-sessions-$UID/paired-window.json`（权限 `0600`，位于权限 `0700` 的私有运行时目录内），绑定四项：socket 身份、socket 路径、扩展主机 PID、工作区根目录。写入使用临时文件加 `os.replace`，避免读到半成品。
 
 ### 运行时行为
+
+以下均指走到了 VSCode 启动路径时（`RESUME_FORCE_LAUNCH=auto` 在 Comate/VSCode 环境中，或显式 `=vscode`）；默认的 `print` 不会碰桥接。
 
 **桥接可用**（存在有效的已确认配对）：把每个选中的会话作为独立终端追加到已配对窗口。该窗口已有的终端、编辑器和其它窗口状态一律不变。
 
@@ -218,7 +230,7 @@ VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定
 | `RESUME_PROJECTS_ROOT=<dir>` | 会话扫描根目录（默认 `~/.claude/projects`） |
 | `RESUME_SKIP_PERMISSIONS=1` | 显式启用 `--dangerously-skip-permissions`（默认关闭） |
 | `RESUME_FORCE_SELECT=gui\|tui` | 强制选择界面类型 |
-| `RESUME_FORCE_LAUNCH=terminal\|vscode\|tmux\|seq\|print` | 强制启动方式（[`print` = 只打印命令不启动](#只打印命令不启动print)） |
+| `RESUME_FORCE_LAUNCH=print\|auto\|terminal\|vscode\|tmux\|seq` | 启动方式，**默认 `print`**（[只打印命令不启动](#只打印命令不启动默认)）；`auto` = 自动识别环境并真的启动 |
 | `RESUME_PYBIN=/path/to/python` | 指定用于 GUI 的 python |
 | `RESUME_AUTO_SELECT=1` | 不弹界面，直接用默认勾选 |
 | `RESUME_DRY_RUN=1` | 只打印将要恢复的会话，不真正启动 |
@@ -247,7 +259,7 @@ VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定
 
 ```bash
 npm --prefix comate-bridge test          # 15 个 Node 测试
-python3 -m unittest discover -s tests    # 107 个 Python 测试
+python3 -m unittest discover -s tests    # 109 个 Python 测试
 bash -n resume-claude-sessions.sh scripts/*.sh
 ```
 

@@ -12,23 +12,26 @@
 # Keys: ↑/↓ or j/k move · SPACE toggle · a all · n none · g group · c cli
 #       ENTER confirm · q quit
 #
-# Launch (auto-detected):
+# DEFAULT: print, launch nothing. Pick sessions as usual, then get one
+# paste-ready command per session on stdout (grouped by Gn) — paste each into
+# whichever terminal you want it in. Launching is opt-in because no launcher can
+# put a session in a terminal you already have open; they all make new ones.
+# The picker draws on /dev/tty, so `> cmds.txt` / `| xclip` stay clean.
+#
+# Launch for real with RESUME_FORCE_LAUNCH=<mode>:
+#   * auto    -> detect the platform (what every mode below was picked from
+#                automatically before print became the default)
 #   * macOS   -> one Terminal.app WINDOW per group, one TAB per session
 #                (+CLI = extra tab). Tabs need Accessibility perm; else windows.
 #   * Ubuntu  -> gnome-terminal/konsole: one window per group, tab per session.
-#   * VSCode  -> writes .vscode/tasks.json (one dedicated panel per session,
-#                grouped); press Ctrl/Cmd+Shift+B.
+#   * VSCode  -> bridge into the current window if paired, else a new window
+#                rooted at the work folder with one dedicated terminal per
+#                session (runOn: folderOpen).
 #   * headless-> tmux: one SESSION per group, one WINDOW per session (+CLI win).
 #                No tmux -> sequential in this terminal.
 #
-# Launch nothing, just print (opt-in only, never auto-detected):
-#   RESUME_FORCE_LAUNCH=print — pick sessions as usual, then print one
-#   paste-ready command per session on stdout (grouped by Gn) and launch
-#   nothing. For when you want the sessions in terminals you already have open.
-#   The picker draws on /dev/tty, so `> cmds.txt` / `| xclip` stay clean.
-#
 # Test/override:
-#   RESUME_FORCE_LAUNCH=terminal|vscode|tmux|seq|print   RESUME_DRY_RUN=1
+#   RESUME_FORCE_LAUNCH=print|auto|terminal|vscode|tmux|seq   RESUME_DRY_RUN=1
 #   RESUME_AUTO_SELECT=1 (take defaults, no prompt)
 # NOTE: no `set -e` here. This script is written throughout in the
 # `[ cond ] && action` idiom (move(), case arms, launch loops); under errexit a
@@ -103,9 +106,13 @@ done
 total="${#sel_id[@]}"
 
 # --- launch-mode detection ---------------------------------------------------
+# Default is print: no launcher can put a session into a terminal you already
+# have open, so opening anything is opt-in. RESUME_FORCE_LAUNCH names a mode
+# directly, or `auto` for the platform sniffing that used to be the default.
 UNAME="$(uname -s)"
 detect_launch() {
-  [ -n "${RESUME_FORCE_LAUNCH:-}" ] && { echo "$RESUME_FORCE_LAUNCH"; return; }
+  local want="${RESUME_FORCE_LAUNCH:-print}"
+  [ "$want" = "auto" ] || { echo "$want"; return; }
   if [ "${TERM_PROGRAM:-}" = "vscode" ] || [ -n "${VSCODE_INJECTION:-}" ] \
      || [ -n "${VSCODE_GIT_ASKPASS_NODE:-}" ] || [ -n "${VSCODE_IPC_HOOK_CLI:-}" ]; then
     echo "vscode"; return
@@ -522,6 +529,7 @@ launch_print() {
   # screen would be hostile.
   [ "$TUI_DREW" = "1" ] && [ -t 1 ] && printf '\033[2J\033[H'
   echo "以下命令逐条复制，粘贴到你想用的终端里执行（相同 G 号原本会合并到一个窗口）："
+  echo "（想让脚本直接开终端/窗口：RESUME_FORCE_LAUNCH=auto）"
   echo
   for g in $chosen_groups; do
     for i in "${chosen_idx[@]}"; do
