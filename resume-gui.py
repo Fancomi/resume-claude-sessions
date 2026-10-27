@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-# GUI session picker for resume-claude-sessions.sh (macOS / Linux desktop).
+# GUI session picker for resume-sessions.sh (macOS / Linux desktop).
 # Reads TSV records on stdin, one per line:
-#     idx  date  day_label  time  group  checked  cwd
+#     idx  date  day_label  time  group  checked  cwd  [display]
+# (display is optional; the last column wins when present).
 # Writes chosen sessions on stdout, one per line:
 #     idx  group  cli
 # Exit 0 = confirmed (possibly empty), non-zero = cancelled.
+#
+# The launcher supplies RESUME_GUI_TITLE / RESUME_GUI_HINT so the same window
+# can serve both Claude and Codex sessions.
 #
 # Real table via ttk.Treeview: date groups are collapsible parent rows, sessions
 # are child rows. Columns align perfectly. Per session row:
 #   开(☑/☐ click)  组(number, double-click to edit)  +CLI(✔ click)  时间  路径(#0)
 # Clicking a date parent's 开 cell toggles the whole group. Space toggles 开.
+import os
 import sys
 import tkinter as tk
 from tkinter import ttk
@@ -32,6 +37,7 @@ def read_records():
         recs.append({
             "idx": idx, "date": date, "label": label, "time": tm,
             "group": group, "checked": checked == "1", "cwd": cwd,
+            "display": parts[7] if len(parts) > 7 else cwd,
         })
     return recs
 
@@ -48,7 +54,7 @@ class Picker:
         self.kids = {}      # parent item_id -> [session item_id]
         self._editor = None
 
-        root.title("Claude Code · 恢复会话（按日期分组）")
+        root.title(os.environ.get("RESUME_GUI_TITLE", "Claude Code · 恢复会话（按日期分组）"))
         root.geometry("1040x660")
         root.minsize(760, 420)
         try:
@@ -60,8 +66,9 @@ class Picker:
         top.pack(fill="x")
         ttk.Label(
             top,
-            text="勾选要恢复的会话（点“开”列的框）。相同 组 号 = 合并到一个窗口的多个标签页"
-                 "（双击“组”列改号）；+CLI = 为该会话再开一个可跑命令的终端。",
+            text=os.environ.get("RESUME_GUI_HINT",
+                 "勾选要恢复的会话（点“开”列的框）。相同 组 号 = 合并到一个窗口的多个标签页"
+                 "（双击“组”列改号）；+CLI = 为该会话再开一个可跑命令的终端。"),
             wraplength=1000, justify="left",
         ).pack(anchor="w")
         bar = ttk.Frame(top)
@@ -128,7 +135,7 @@ class Picker:
                 self.kids[pid] = []
             pid = self.date_item[rec["date"]]
             iid = self.tree.insert(
-                pid, "end", text="    " + rec["cwd"],
+                pid, "end", text="    " + rec["display"],
                 values=(CHECK_ON if rec["checked"] else CHECK_OFF,
                         rec["group"], CLI_OFF, rec["time"]),
             )

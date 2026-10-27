@@ -1,20 +1,22 @@
-"""Safety tests for resume-claude-sessions.sh's VSCode launch path.
+"""Safety tests for the shared launcher's VSCode launch and print paths.
 
 Two layers:
 
-1. Source-safety assertions (no subprocess): grep the shell script text to
+1. Source-safety assertions (no subprocess): grep the shell engine text to
    make sure the bridge-first / fixed-new-window-fallback contract is wired
    up the way the brief requires, and that no reuse/reload path exists.
-2. Subprocess behaviour tests: copy the real script into a temp directory
-   alongside a FAKE bridge client (a tiny Python script we write ourselves)
-   and a FAKE Comate CLI (a recording shell script), then run the launcher
-   with RESUME_AUTO_SELECT=1 and assert what each bridge exit code causes it
-   to do. The real `comate`/`code` CLI and the real bridge client are never
-   invoked; VSCODE_IPC_HOOK_CLI is only ever pointed at a harmless temp path.
+2. Subprocess behaviour tests: copy the real engine and its entry-point
+   wrappers into a temp directory alongside a FAKE bridge client (a tiny
+   Python script we write ourselves) and a FAKE Comate CLI (a recording shell
+   script), then run the launcher with RESUME_AUTO_SELECT=1 and assert what
+   each bridge exit code causes it to do. The real `comate`/`code` CLI and the
+   real bridge client are never invoked; VSCODE_IPC_HOOK_CLI is only ever
+   pointed at a harmless temp path.
 """
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,7 +27,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_PATH = ROOT / "resume-claude-sessions.sh"
+SOURCE_PATH = ROOT / "resume-sessions.sh"
+ENTRY_POINT = ROOT / "resume-claude-sessions.sh"
 
 
 class LauncherSafetyTests(unittest.TestCase):
@@ -231,11 +234,13 @@ class LauncherSandboxMixin:
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
 
-        # Copy only the files needed to run the launcher in isolation.
+        # Copy only the files needed to run the launcher in isolation: the
+        # shared engine plus both entry points (tests drive the Claude one).
         (root / "bridge").mkdir()
-        script_text = SOURCE_PATH.read_text()
-        (root / "resume-claude-sessions.sh").write_text(script_text)
-        (root / "resume-claude-sessions.sh").chmod(0o755)
+        for name in ("resume-sessions.sh", "resume-claude-sessions.sh", "resume-codex-sessions.sh"):
+            target = root / name
+            shutil.copy2(SOURCE_PATH.parent / name, target)
+            target.chmod(0o755)
 
         bridge_record = root / "bridge_input0.bin"
         fake_client = root / "bridge" / "comate_bridge_client.py"
@@ -314,7 +319,7 @@ class LauncherSandboxMixin:
                 if v is None:
                     env.pop(k, None)
         result = subprocess.run(
-            ["bash", str(root / "resume-claude-sessions.sh")],
+            ["bash", str(root / ENTRY_POINT.name)],
             cwd=root,
             env=env,
             input=stdin,
@@ -368,16 +373,17 @@ class LauncherBridgeSubprocessTests(LauncherSandboxMixin, unittest.TestCase):
             comate_record.exists(), "status 4 (terminal creation errors) must never trigger the new-window fallback"
         )
 
-    def test_bridge_record_includes_selected_cwd_and_default_safe_permissions(self):
+    def test_bridge_record_includes_selected_cwd_and_default_skip_permissions(self):
         root, bridge_record, comate_record, bin_dir = self._make_sandbox(probe_exit=0, send_exit=0)
         result = self._run(root, bin_dir)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         data = bridge_record.read_bytes()
         fields = data[:-1].decode("utf-8").split("\0") if data.endswith(b"\0") else data.decode("utf-8").split("\0")
         self.assertIn(str(root / "work"), fields)
-        # dangerous flag defaults to "0" unless RESUME_SKIP_PERMISSIONS=1.
-        self.assertIn("0", fields)
-        self.assertNotIn("1", fields)
+        # Unattended is the default: dangerous flag "1" unless
+        # RESUME_SKIP_PERMISSIONS=0.
+        self.assertIn("1", fields)
+        self.assertNotIn("0", fields)
 
     def test_skip_permissions_env_sets_dangerous_flag_in_bridge_record(self):
         root, bridge_record, comate_record, bin_dir = self._make_sandbox(probe_exit=0, send_exit=0)
@@ -386,6 +392,15 @@ class LauncherBridgeSubprocessTests(LauncherSandboxMixin, unittest.TestCase):
         data = bridge_record.read_bytes()
         fields = data[:-1].decode("utf-8").split("\0")
         self.assertIn("1", fields)
+
+    def test_skip_permissions_zero_disables_dangerous_flag_in_bridge_record(self):
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox(probe_exit=0, send_exit=0)
+        result = self._run(root, bin_dir, extra_env={"RESUME_SKIP_PERMISSIONS": "0"})
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        data = bridge_record.read_bytes()
+        fields = data[:-1].decode("utf-8").split("\0")
+        self.assertIn("0", fields)
+        self.assertNotIn("1", fields)
 
     def test_fallback_workspace_is_valid_json_for_a_quoted_cwd(self):
         # The new-window fallback shares shquote() with print mode. A cwd
@@ -423,14 +438,16 @@ class PrintModeSourceTests(unittest.TestCase):
         self.assertIn("print)", body)
         self.assertIn("launch_print", body)
 
-    def test_print_is_the_default_and_auto_opts_into_detection(self):
-        # Launching anything must be explicit: detect_launch() defaults to
-        # print, and the platform sniffing that used to be the default is
-        # reachable only via RESUME_FORCE_LAUNCH=auto.
+    def test_print_is_the_claude_default_and_auto_opts_into_detection(self):
+        # Claude launches nothing by default; Codex keeps upstream's auto mode.
+        # Either way, platform sniffing is reachable only via
+        # RESUME_FORCE_LAUNCH=auto.
         idx = self.source.index("detect_launch() {")
         body = self.source[idx : self.source.index("\n}\n", idx)]
-        self.assertIn("${RESUME_FORCE_LAUNCH:-print}", body)
+        self.assertIn('${RESUME_FORCE_LAUNCH:-$DEFAULT_LAUNCH_MODE}', body)
         self.assertIn('= "auto"', body)
+        self.assertIn('DEFAULT_LAUNCH_MODE="print"', self.source)
+        self.assertIn('DEFAULT_LAUNCH_MODE="auto"', self.source)
 
     def test_launch_print_invokes_no_launcher(self):
         idx = self.source.index("launch_print() {")
@@ -455,6 +472,13 @@ class LauncherPrintModeTests(LauncherSandboxMixin, unittest.TestCase):
     def _claude(self, bin_dir):
         return str(bin_dir / "claude")
 
+    def _resume_line(self, bin_dir, session):
+        return "cd '%s' && %s --resume %s --dangerously-skip-permissions\n" % (
+            session["cwd"],
+            self._claude(bin_dir),
+            session["id"],
+        )
+
     def test_print_is_the_default_with_no_force_launch(self):
         # No RESUME_FORCE_LAUNCH at all, and a VSCode-looking environment that
         # detection used to latch onto: the default must still be print, so a
@@ -465,8 +489,7 @@ class LauncherPrintModeTests(LauncherSandboxMixin, unittest.TestCase):
         s = self.session_info[0]
         self.assertEqual(
             result.stdout,
-            "# G0  resume: %s [%s]\n" % (s["name"], s["time"])
-            + "cd '%s' && %s --resume %s\n" % (s["cwd"], self._claude(bin_dir), s["id"]),
+            "# G0  resume: %s [%s]\n" % (s["name"], s["time"]) + self._resume_line(bin_dir, s),
         )
         self.assertFalse(bridge_record.exists())
         self.assertFalse(comate_record.exists())
@@ -477,10 +500,7 @@ class LauncherPrintModeTests(LauncherSandboxMixin, unittest.TestCase):
         result = self._run(root, bin_dir, extra_env=self.PRINT_ENV)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         s = self.session_info[0]
-        expected = (
-            "# G0  resume: %s [%s]\n" % (s["name"], s["time"])
-            + "cd '%s' && %s --resume %s\n" % (s["cwd"], self._claude(bin_dir), s["id"])
-        )
+        expected = "# G0  resume: %s [%s]\n" % (s["name"], s["time"]) + self._resume_line(bin_dir, s)
         self.assertEqual(result.stdout, expected)
 
     def test_stdout_has_no_ansi_escapes_or_trailing_whitespace(self):
@@ -501,10 +521,24 @@ class LauncherPrintModeTests(LauncherSandboxMixin, unittest.TestCase):
             "print mode must never write the workspace file",
         )
 
-    def test_default_command_omits_dangerous_flag(self):
+    def test_default_command_skips_permissions(self):
+        # Unattended is the default; RESUME_SKIP_PERMISSIONS=0 opts back into
+        # Claude's normal permission prompts.
         root, bridge_record, comate_record, bin_dir = self._make_sandbox()
         result = self._run(root, bin_dir, extra_env=self.PRINT_ENV)
-        self.assertNotIn("--dangerously-skip-permissions", result.stdout)
+        self.assertIn("--dangerously-skip-permissions", result.stdout)
+
+    def test_skip_permissions_zero_omits_dangerous_flag(self):
+        root, bridge_record, comate_record, bin_dir = self._make_sandbox()
+        env = dict(self.PRINT_ENV, RESUME_SKIP_PERMISSIONS="0")
+        result = self._run(root, bin_dir, extra_env=env)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        s = self.session_info[0]
+        self.assertEqual(
+            result.stdout,
+            "# G0  resume: %s [%s]\n" % (s["name"], s["time"])
+            + "cd '%s' && %s --resume %s\n" % (s["cwd"], self._claude(bin_dir), s["id"]),
+        )
 
     def test_skip_permissions_env_appears_in_printed_command(self):
         root, bridge_record, comate_record, bin_dir = self._make_sandbox()
@@ -533,15 +567,16 @@ class LauncherPrintModeTests(LauncherSandboxMixin, unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         new, old = self.session_info
         claude = self._claude(bin_dir)
+        flags = " --dangerously-skip-permissions"
         expected = (
             "# G0  resume: %s [%s]\n" % (new["name"], new["time"])
-            + "cd '%s' && %s --resume %s\n" % (new["cwd"], claude, new["id"])
+            + "cd '%s' && %s --resume %s%s\n" % (new["cwd"], claude, new["id"], flags)
             + "\n"
             + "# G0  cli: %s\n" % new["name"]
             + "cd '%s'\n" % new["cwd"]
             + "\n"
             + "# G1  resume: %s [%s]\n" % (old["name"], old["time"])
-            + "cd '%s' && %s --resume %s\n" % (old["cwd"], claude, old["id"])
+            + "cd '%s' && %s --resume %s%s\n" % (old["cwd"], claude, old["id"], flags)
         )
         self.assertEqual(result.stdout, expected)
 

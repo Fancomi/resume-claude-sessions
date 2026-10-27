@@ -23,6 +23,20 @@ from bridge.comate_bridge_client import (
     socket_paths,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def short_tmpdir():
+    """A temp root short enough for AF_UNIX socket paths.
+
+    macOS caps sun_path at ~104 bytes, and its default per-user temp directory
+    leaves no room once the runtime-dir and bridge socket names are appended.
+    Linux and CI are fine either way.
+    """
+    if sys.platform == "darwin" and os.path.isdir("/tmp"):
+        return "/tmp"
+    return tempfile.gettempdir()
+
 
 class ClientTests(unittest.TestCase):
     def test_identity_matches_node_contract(self):
@@ -402,7 +416,7 @@ class ProbeTests(unittest.TestCase):
     def test_probe_succeeds_against_metadata_and_live_socket(self):
         from bridge.comate_bridge_client import probe
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(dir=short_tmpdir()) as tmpdir:
             ipc_hook = "/tmp/vscode-ipc-probe-test.sock"
             paths = socket_paths(ipc_hook, uid=os.getuid(), tmpdir=tmpdir)
             os.makedirs(paths.runtime_dir, exist_ok=True)
@@ -441,7 +455,7 @@ class _PairingFixture(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=short_tmpdir())
         self.addCleanup(self.tmp.cleanup)
         self.tmpdir = self.tmp.name
         self.uid = os.getuid()
@@ -459,6 +473,18 @@ class _PairingFixture(unittest.TestCase):
             except OSError:
                 pass
 
+    @staticmethod
+    def _drain_accepts(server):
+        while True:
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            try:
+                connection.close()
+            except OSError:
+                pass
+
     def _make_live_socket(self, identity, pid=None, metadata_overrides=None, metadata_mode=0o600):
         """Bind a real listening Unix socket plus adjacent metadata file.
 
@@ -471,6 +497,12 @@ class _PairingFixture(unittest.TestCase):
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(socket_path)
         server.listen(1)
+        # Drain accepted connections in the background. Liveness probing is a
+        # connect-then-close; with a backlog of 1, macOS refuses the *second*
+        # probe (the first abandoned connection still occupies the queue) and
+        # a candidate that is plainly alive looks dead. Linux tolerates it;
+        # accepting-and-closing makes the fixture portable to both.
+        threading.Thread(target=self._drain_accepts, args=(server,), daemon=True).start()
         self._servers.append(server)
 
         metadata = {"version": 1, "pid": pid if pid is not None else os.getpid(), "identity": identity}

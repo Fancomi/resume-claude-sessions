@@ -12,7 +12,7 @@
 #   --i-understand-this-opens-a-new-test-window
 #
 # This script is for manual, authorized verification only. It is not part of
-# the normal resume-claude-sessions.sh launch flow and is never invoked by
+# the normal resume-sessions.sh launch flow and is never invoked by
 # it.
 set -uo pipefail
 

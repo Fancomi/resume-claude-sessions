@@ -17,8 +17,7 @@
 #   scripts/pair-comate-bridge.sh --confirmed-current-window
 #
 # Env:
-#   RESUME_VSCODE_FOLDER   workspace root to pair (default:
-#                          /root/paddlejob/workspace/env_run/penghaotian)
+#   RESUME_VSCODE_FOLDER   workspace root to pair (default: current directory)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,8 +29,7 @@ if [ "${1:-}" != "--confirmed-current-window" ]; then
   exit 1
 fi
 
-DEFAULT_FOLDER="/root/paddlejob/workspace/env_run/penghaotian"
-FOLDER="${RESUME_VSCODE_FOLDER:-$DEFAULT_FOLDER}"
+FOLDER="${RESUME_VSCODE_FOLDER:-$PWD}"
 
 python3 "$ROOT/bridge/comate_bridge_client.py" pair \
   --workspace-root "$FOLDER" \

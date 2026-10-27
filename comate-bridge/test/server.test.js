@@ -7,6 +7,11 @@ const path = require('node:path');
 const { startServer } = require('../lib/server');
 const { readJsonLine, writeJsonLine } = require('../lib/protocol');
 
+// macOS caps AF_UNIX socket paths at ~104 bytes; its default per-user temp
+// directory leaves no room for the runtime dir and socket name appended.
+const SHORT_TMP = process.platform === 'darwin' && fs.existsSync('/tmp') ? '/tmp' : os.tmpdir();
+const makeTmpDir = () => fs.mkdtempSync(path.join(SHORT_TMP, 'bridge-test-'));
+
 function request(socketPath, payload) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
@@ -24,7 +29,7 @@ const payload = () => ({ version: 1, requestId: 'a'.repeat(32), terminals: [
 ] });
 
 test('creates only requested terminals and returns their count', async t => {
-  const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-test-'));
+  const tmpdir = makeTmpDir();
   const created = [];
   const server = await startServer({ ipcHook: '/tmp/test-window', tmpdir, uid: 42,
     createTerminal: async descriptor => created.push(descriptor), logger: { info() {}, error() {} } });
@@ -35,7 +40,7 @@ test('creates only requested terminals and returns their count', async t => {
 });
 
 test('malformed request creates no terminals', async t => {
-  const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-test-'));
+  const tmpdir = makeTmpDir();
   const created = [];
   const server = await startServer({ ipcHook: '/tmp/test-window-2', tmpdir, uid: 43,
     createTerminal: async descriptor => created.push(descriptor), logger: { info() {}, error() {} } });
@@ -60,7 +65,7 @@ test('readJsonLine resolves with the parsed object up to the first newline', asy
     const value = await readJsonLine(socket);
     socket.end(`${JSON.stringify({ echoed: value })}\n`);
   });
-  const socketPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-test-')), 'rjl.sock');
+  const socketPath = path.join(makeTmpDir(), 'rjl.sock');
   await new Promise(resolve => server.listen(socketPath, resolve));
   try {
     const response = await request(socketPath, { hello: 'world' });
@@ -80,7 +85,7 @@ test('readJsonLine rejects on malformed JSON before the newline', async () => {
       socket.end(`${JSON.stringify({ error: error.message })}\n`);
     }
   });
-  const socketPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-test-')), 'rjl-bad.sock');
+  const socketPath = path.join(makeTmpDir(), 'rjl-bad.sock');
   await new Promise(resolve => server.listen(socketPath, resolve));
   try {
     const response = await new Promise((resolve, reject) => {
@@ -106,7 +111,7 @@ test('readJsonLine rejects when payload exceeds the byte cap', async () => {
       // socket already destroyed by readJsonLine; nothing to write back.
     }
   });
-  const socketPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-test-')), 'rjl-big.sock');
+  const socketPath = path.join(makeTmpDir(), 'rjl-big.sock');
   await new Promise(resolve => server.listen(socketPath, resolve));
   try {
     await new Promise((resolve, reject) => {
@@ -124,7 +129,7 @@ test('readJsonLine rejects when payload exceeds the byte cap', async () => {
 });
 
 test('close() resolves promptly even while a client holds an idle connection open', async t => {
-  const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-test-'));
+  const tmpdir = makeTmpDir();
   const server = await startServer({ ipcHook: '/tmp/test-window-idle', tmpdir, uid: 44,
     createTerminal: async () => {}, logger: { info() {}, error() {} } });
   t.after(() => fs.rmSync(tmpdir, { recursive: true, force: true }));
@@ -154,7 +159,7 @@ test('writeJsonLine writes newline-terminated JSON and ends the socket', async (
   const server = net.createServer(socket => {
     writeJsonLine(socket, { version: 1, created: 0, errors: [] });
   });
-  const socketPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-test-')), 'wjl.sock');
+  const socketPath = path.join(makeTmpDir(), 'wjl.sock');
   await new Promise(resolve => server.listen(socketPath, resolve));
   try {
     const raw = await new Promise((resolve, reject) => {

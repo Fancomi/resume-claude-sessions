@@ -16,6 +16,6 @@ __pycache__/
 /dist/
 
 # Generated VSCode workspace overwritten on every launch by
-# launch_vscode_new_window() (resume-claude-sessions.sh); contains local
+# launch_vscode_new_window() (resume-sessions.sh); contains local
 # absolute paths, never secrets, but is a machine-specific build artifact.
 /resume-sessions.code-workspace

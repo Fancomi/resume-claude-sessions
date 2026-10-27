@@ -26,7 +26,7 @@ if [ ! -f "$VSIX" ]; then
   exit 1
 fi
 
-# Same safe discovery order as resume-claude-sessions.sh's vscode_cli(): if
+# Same safe discovery order as resume-sessions.sh's vscode_cli(): if
 # VSCODE_GIT_ASKPASS_NODE is set, look for an executable entry (preferring
 # "comate" if present) under its sibling server/bin/remote-cli directory —
 # this is the usable CLI in a remote-container session where no CLI is on

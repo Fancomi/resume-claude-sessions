@@ -189,6 +189,10 @@ if ($chosen.Count -eq 0) { exit 0 }
 
 # --- Launch: one Windows Terminal window per group, one tab per session ------
 # (a group's rows collapse into tabs of a single wt window; +CLI adds a shell tab)
+# Unattended by default, same as the macOS/Linux launcher; set
+# RESUME_SKIP_PERMISSIONS=0 to keep Claude's normal permission prompts.
+$dangerousArg = ' --dangerously-skip-permissions'
+if ($env:RESUME_SKIP_PERMISSIONS -eq '0') { $dangerousArg = '' }
 function Q($s) { '"' + ($s -replace '"','\"') + '"' }
 
 $groups = $chosen | Group-Object Group
@@ -199,7 +203,7 @@ foreach ($g in $groups) {
         $s = $item.Session
         if (-not $first) { $wtArgs.Add(';') }
         $first = $false
-        $resume = "$claudeCmd --resume $($s.Id) --dangerously-skip-permissions"
+        $resume = "$claudeCmd --resume $($s.Id)$dangerousArg"
         $wtArgs.AddRange([string[]]@('new-tab','--title',$s.Name,'-d',$s.Cwd,'cmd','/k',$resume))
         if ($item.Cli) {
             $wtArgs.Add(';')
