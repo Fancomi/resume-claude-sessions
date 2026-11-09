@@ -3,6 +3,7 @@
 param(
     [Alias('CodexHome')][string]$DataHome,
     [string]$CodexCommand,
+    [ValidateSet('conhost', 'wt')][string]$TerminalHost = 'conhost',
     [switch]$List,
     [switch]$AutoSelect,
     [switch]$DryRun,
@@ -120,7 +121,11 @@ function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [s
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $label = New-Object System.Windows.Forms.Label
-    $label.Text = '默认勾选最近日期的会话。相同的正整数分组 = 一个窗口多个标签页；0 / 留空 = 独立窗口。+CLI 额外打开命令行。'
+    $label.Text = if ($TerminalHost -eq 'wt') {
+        '默认勾选最近日期的会话。相同的正整数分组 = 一个窗口多个标签页；0 / 留空 = 独立窗口。+CLI 额外打开命令行。'
+    } else {
+        '默认使用独立控制台，避开 Windows Terminal 切换窗口后的中文输入问题；每个会话单独开窗口。+CLI 另开命令行。'
+    }
     $label.SetBounds(12, 12, 1080, 36)
     $label.Anchor = 'Top,Left,Right'
     $form.Controls.Add($label)
@@ -279,7 +284,11 @@ function Invoke-CodexResume {
         }
         return
     }
-    $terminal = Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue
+    $windowsTerminal = $null
+    if ($TerminalHost -eq 'wt') {
+        $windowsTerminal = Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue
+        if (-not $windowsTerminal) { throw '找不到 Windows Terminal；请使用默认的 -TerminalHost conhost。' }
+    }
     foreach ($group in ($chosen | Group-Object Group)) {
         $arguments = New-Object 'System.Collections.Generic.List[string]'
         $arguments.Add('-w')
@@ -291,7 +300,7 @@ function Invoke-CodexResume {
             foreach ($cli in $tabKinds) {
                 $encoded = New-CodexTabCommand -Session $item.Session -Command $command -SessionHome $sessionHome -Cli:$cli -BypassPermissions:$bypass
                 $shellArgs = @('-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)
-                if ($terminal) {
+                if ($windowsTerminal) {
                     if (-not $first) { $arguments.Add(';') }
                     $first = $false
                     $title = ($item.Session.Name -replace '[^a-zA-Z0-9._-]', '_')
@@ -301,11 +310,13 @@ function Invoke-CodexResume {
                     $arguments.AddRange([string[]]@('new-tab', '--title', $title, 'powershell.exe'))
                     $arguments.AddRange([string[]]$shellArgs)
                 } else {
-                    Start-Process -FilePath 'powershell.exe' -ArgumentList $shellArgs | Out-Null
+                    # Explicit conhost bypasses Windows' default terminal delegation.
+                    $consoleHost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+                    Start-Process -FilePath $consoleHost -ArgumentList (@('powershell.exe') + $shellArgs) | Out-Null
                 }
             }
         }
-        if ($terminal) { Start-Process -FilePath $terminal.Source -ArgumentList $arguments.ToArray() | Out-Null }
+        if ($windowsTerminal) { Start-Process -FilePath $windowsTerminal.Source -ArgumentList $arguments.ToArray() | Out-Null }
     }
 }
 

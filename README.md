@@ -72,7 +72,9 @@ Codex：双击 `还原Codex会话.bat`，或：
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\resume-codex-sessions.ps1
 ```
 
-Windows 版是两套独立的 PowerShell/WinForms 实现，不依赖 Python。Claude 版会跳过命令行里已带 `--resume <id>` 的进程；Codex 版同理识别已打开的会话，优先使用 Windows Terminal，恢复时加 `--no-daemon`，BAT 入口还设置了 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（本机地址绕过）。
+Windows 版是两套独立的 PowerShell/WinForms 实现，不依赖 Python。Claude 版会跳过命令行里已带 `--resume <id>` 的进程；Codex 版同理识别已打开的会话，默认显式使用 Windows Console Host（`conhost.exe`），每个会话打开独立的 PowerShell 窗口，避开 Windows Terminal 切换窗口后的中文输入异常。恢复时加 `--no-daemon`，BAT 入口还设置了 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（本机地址绕过）。
+
+直接双击原来的 `还原Codex会话.bat` 即使用默认独立控制台；不修改系统默认终端或输入法设置。需要 Windows Terminal 的分组标签页时，可运行 `还原Codex会话.bat -TerminalHost wt`；`-TerminalHost conhost` 使用默认行为。相关输入法问题见 [Windows Terminal 上游报告](https://github.com/microsoft/terminal/issues/20481)。
 
 ### Comate / VSCode 远程（追加到当前窗口）
 
@@ -185,7 +187,7 @@ RESUME_FORCE_LAUNCH=auto ./resume-claude-sessions.sh
 Codex 版扫描 `$CODEX_HOME/sessions`（默认 `~/.codex/sessions`）下的 `rollout-*.jsonl`，从 `session_meta.payload` 读取会话 ID 和工作目录，用 `codex resume <id> --cd <目录>` 恢复。
 
 - 会话按日志最后修改日期分组，默认勾选最近日期；
-- 组 `0`（Windows 也可留空）= 独立窗口；其余正整数分组 = 一个窗口多个标签页；
+- 组 `0`（Windows 也可留空）= 独立窗口；支持标签页的终端将其余正整数分组放进一个窗口。Windows Codex 默认独立控制台为每个会话单独开窗口；
 - 工作目录不存在、损坏日志和子代理会话默认跳过（`RESUME_INCLUDE_SUBAGENTS=1` 可包含子代理）；
 - 同一 ID 有多份 rollout 时取最新的一份；
 - 恢复命令默认带 `--dangerously-bypass-approvals-and-sandbox`，并显式设置 `CODEX_HOME`，避免复用旧环境变量；
@@ -331,7 +333,7 @@ VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定
 | `codex_sessions.py` | Codex rollout 元数据读取器（只读，不修改会话文件） |
 | `resume-gui.py` | GUI 表格选择器（tkinter，被引擎自动调用） |
 | `resume-claude-sessions.ps1` · `还原Claude会话.bat` | Windows Claude 版（WinForms GUI） |
-| `resume-codex-sessions.ps1` · `还原Codex会话.bat` | Windows Codex 版（WinForms + Windows Terminal） |
+| `resume-codex-sessions.ps1` · `还原Codex会话.bat` | Windows Codex 版（WinForms + 独立控制台，可选 Windows Terminal） |
 | `comate-bridge/` | Comate 桥接扩展：`extension.js` 与 `lib/{identity,protocol,server}.js` |
 | `bridge/comate_bridge_client.py` | Python 桥接客户端与 CLI |
 | `scripts/package-comate-bridge.py` | 确定性 VSIX 打包 |
@@ -344,8 +346,14 @@ VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定
 
 ```bash
 npm --prefix comate-bridge test          # 15 个 Node 测试
-python3 -m unittest discover -s tests    # 122 个 Python 测试
+python3 -m unittest discover -s tests    # Python 离线测试；Windows 启动项在下方单独运行
 bash -n resume-sessions.sh resume-claude-sessions.sh resume-codex-sessions.sh scripts/*.sh
+```
+
+Windows Codex 启动路径回归（拦截进程创建，不打开真实会话）：
+
+```powershell
+python -B -m unittest discover -s tests -p test_codex_launcher_windows.py -v
 ```
 
 全部为离线测试：使用临时假 socket、假 CLI、假 `CODEX_HOME` 与源码断言，不会调用真实 Comate/Codex/Claude、不安装扩展、不打开或关闭窗口。源码断言会检查代码里不存在 `-r`、`--reuse-window`、reload 命令，以及任何操作已有终端的调用。
