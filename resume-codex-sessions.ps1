@@ -3,7 +3,7 @@
 param(
     [Alias('CodexHome')][string]$DataHome,
     [string]$CodexCommand,
-    [ValidateSet('conhost', 'wt')][string]$TerminalHost = 'conhost',
+    [ValidateSet('wezterm', 'conhost', 'wt')][string]$TerminalHost = 'wezterm',
     [switch]$List,
     [switch]$AutoSelect,
     [switch]$DryRun,
@@ -12,6 +12,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'scripts\wezterm.ps1')
 
 function Test-CodexSubagent($Source) {
     if ($Source -is [string]) { return ($Source -replace '_', '') -match '^subagent' }
@@ -121,7 +122,7 @@ function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [s
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $label = New-Object System.Windows.Forms.Label
-    $label.Text = if ($TerminalHost -eq 'wt') {
+    $label.Text = if ($TerminalHost -ne 'conhost') {
         '默认勾选最近日期的会话。相同的正整数分组 = 一个窗口多个标签页；0 / 留空 = 独立窗口。+CLI 额外打开命令行。'
     } else {
         '默认使用独立控制台，避开 Windows Terminal 切换窗口后的中文输入问题；每个会话单独开窗口。+CLI 另开命令行。'
@@ -240,6 +241,7 @@ function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [s
 }
 
 function Invoke-CodexResume {
+    Set-ResumeProxyEnvironment
     $sessionHome = $DataHome
     if (-not $sessionHome) { $sessionHome = $env:RESUME_CODEX_HOME }
     if (-not $sessionHome) { $sessionHome = $env:CODEX_HOME }
@@ -287,9 +289,11 @@ function Invoke-CodexResume {
     $windowsTerminal = $null
     if ($TerminalHost -eq 'wt') {
         $windowsTerminal = Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue
-        if (-not $windowsTerminal) { throw '找不到 Windows Terminal；请使用默认的 -TerminalHost conhost。' }
+        if (-not $windowsTerminal) { throw '找不到 Windows Terminal；可使用默认 WezTerm 或 -TerminalHost conhost。' }
     }
+    $weztermGroups = @()
     foreach ($group in ($chosen | Group-Object Group)) {
+        $weztermTabs = @()
         $arguments = New-Object 'System.Collections.Generic.List[string]'
         $arguments.Add('-w')
         $arguments.Add('new')
@@ -300,7 +304,13 @@ function Invoke-CodexResume {
             foreach ($cli in $tabKinds) {
                 $encoded = New-CodexTabCommand -Session $item.Session -Command $command -SessionHome $sessionHome -Cli:$cli -BypassPermissions:$bypass
                 $shellArgs = @('-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)
-                if ($windowsTerminal) {
+                if ($TerminalHost -eq 'wezterm') {
+                    $title = $item.Session.Name + ' - ' + $item.Session.Id.Substring(0, 8)
+                    if ($cli) { $title += ' +CLI' }
+                    $weztermTabs += [pscustomobject]@{
+                        title=$title; cwd=$item.Session.Cwd; args=@('powershell.exe') + $shellArgs
+                    }
+                } elseif ($windowsTerminal) {
                     if (-not $first) { $arguments.Add(';') }
                     $first = $false
                     $title = ($item.Session.Name -replace '[^a-zA-Z0-9._-]', '_')
@@ -316,8 +326,10 @@ function Invoke-CodexResume {
                 }
             }
         }
+        if ($TerminalHost -eq 'wezterm') { $weztermGroups += [pscustomobject]@{name=$group.Name; tabs=@($weztermTabs)} }
         if ($windowsTerminal) { Start-Process -FilePath $windowsTerminal.Source -ArgumentList $arguments.ToArray() | Out-Null }
     }
+    if ($weztermGroups.Count) { Start-CodexWezTerm -Groups $weztermGroups }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {

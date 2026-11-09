@@ -66,15 +66,30 @@ Claude Code：双击 `还原Claude会话.bat`，或：
 powershell -ExecutionPolicy Bypass -File resume-claude-sessions.ps1
 ```
 
-Codex：双击 `还原Codex会话.bat`，或：
+Codex：首次双击 [`配置运行环境.bat`](配置运行环境.bat)，准备终端并检查已安装的 Codex CLI；随后双击 `还原Codex会话.bat`。也可以运行：
 
 ```powershell
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\resume-codex-sessions.ps1
 ```
 
-Windows 版是两套独立的 PowerShell/WinForms 实现，不依赖 Python。Claude 版会跳过命令行里已带 `--resume <id>` 的进程；Codex 版同理识别已打开的会话，默认显式使用 Windows Console Host（`conhost.exe`），每个会话打开独立的 PowerShell 窗口，避开 Windows Terminal 切换窗口后的中文输入异常。恢复时加 `--no-daemon`，BAT 入口还设置了 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（本机地址绕过）。
+Windows 版是两套独立的 PowerShell/WinForms 实现，不依赖 Python。Claude 版会跳过命令行里已带 `--resume <id>` 的进程；Codex 版同理识别已打开的会话，默认使用 WezTerm：同组在一个窗口内打开多个标签页，`+CLI` 追加命令行标签。恢复时加 `--no-daemon`。子进程继承已有代理设置；可用 `RESUME_PROXY` 显式指定代理，没有代理设置时会探测本机 7890，端口不可用则保持直连。
 
-直接双击原来的 `还原Codex会话.bat` 即使用默认独立控制台；不修改系统默认终端或输入法设置。需要 Windows Terminal 的分组标签页时，可运行 `还原Codex会话.bat -TerminalHost wt`；`-TerminalHost conhost` 使用默认行为。相关输入法问题见 [Windows Terminal 上游报告](https://github.com/microsoft/terminal/issues/20481)。
+WezTerm 是首次下载的外部依赖：仓库只保存安装脚本和配置，clone 不携带二进制。已验证的包下载约 **70.9 MB**、解压约 **201.8 MB**；共享缓存默认在 `%LOCALAPPDATA%\resume-claude-sessions\wezterm`，多个 clone 复用同一份安装。启动器也能识别 PATH 上足够新的 WezTerm。下载和安装由环境配置入口完成；恢复入口只使用已准备的终端，缺少时提示先配置，不自动下载或更新。
+
+本机已验证的版本为 `20261108-035604-458a100c`。由于旧正式版缺少已合并的 [Windows 输入法崩溃修复](https://github.com/wezterm/wezterm/pull/7529)，首次在线配置使用官方 nightly，并按上游当次 SHA-256 校验、按包摘要缓存实际版本。nightly 下载地址会更新，安装脚本读取同一来源的最新校验文件；已有安装保持锁定，不因重新 clone 而更新。
+
+**中国境内网络也可尝试直连，并非强制使用国际代理。** 下载源是 GitHub Releases，具体可达性和速度取决于当前网络。默认先使用环境代理或可用的本机 7890，再尝试直连；也可明确指定方式：
+
+```powershell
+.\配置运行环境.bat -Direct
+.\配置运行环境.bat -Proxy http://127.0.0.1:7890
+.\配置运行环境.bat -CheckOnly
+.\配置运行环境.bat -ArchivePath 'D:\离线包\WezTerm.zip' -Offline
+```
+
+离线导入的 ZIP 必须匹配 [配置清单](config/wezterm.json) 中已验证版本的 SHA-256；也可以从可联网的机器复制整个共享缓存，再用 `RESUME_WEZTERM_HOME` 指向该目录。WezTerm 已准备好后，打开终端和恢复本地会话入口本身无需再次下载；Codex 请求仍使用其自身已配置的服务。环境配置入口检查 Codex CLI 是否存在，不自动安装 CLI 或替用户登录账户。
+
+需要其他终端时，可运行 `还原Codex会话.bat -TerminalHost wt` 或 `-TerminalHost conhost`。相关输入法问题见 [Windows Terminal 上游报告](https://github.com/microsoft/terminal/issues/20481)。
 
 ### Comate / VSCode 远程（追加到当前窗口）
 
@@ -187,7 +202,7 @@ RESUME_FORCE_LAUNCH=auto ./resume-claude-sessions.sh
 Codex 版扫描 `$CODEX_HOME/sessions`（默认 `~/.codex/sessions`）下的 `rollout-*.jsonl`，从 `session_meta.payload` 读取会话 ID 和工作目录，用 `codex resume <id> --cd <目录>` 恢复。
 
 - 会话按日志最后修改日期分组，默认勾选最近日期；
-- 组 `0`（Windows 也可留空）= 独立窗口；支持标签页的终端将其余正整数分组放进一个窗口。Windows Codex 默认独立控制台为每个会话单独开窗口；
+- 组 `0`（Windows 也可留空）= 独立窗口；其余正整数分组在 WezTerm 等支持标签页的终端中放进一个窗口；
 - 工作目录不存在、损坏日志和子代理会话默认跳过（`RESUME_INCLUDE_SUBAGENTS=1` 可包含子代理）；
 - 同一 ID 有多份 rollout 时取最新的一份；
 - 恢复命令默认带 `--dangerously-bypass-approvals-and-sandbox`，并显式设置 `CODEX_HOME`，避免复用旧环境变量；
@@ -322,6 +337,8 @@ VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定
 | `RESUME_CODEX_HOME` | 优先于 `CODEX_HOME` 的数据目录覆盖；子进程使用同一目录 |
 | `RESUME_CODEX_CMD` | 指定 Codex 可执行文件或脚本路径 |
 | `RESUME_INCLUDE_SUBAGENTS=1` | 包含子代理会话 |
+| `RESUME_PROXY` | Windows 显式指定恢复会话使用的代理；未设置时继承环境，或探测本机 7890 |
+| `RESUME_WEZTERM_HOME` | 覆盖 Windows WezTerm 共享缓存目录，多个 clone 可共用 |
 
 ## 文件结构
 
@@ -333,7 +350,9 @@ VSIX 由 `scripts/package-comate-bridge.py` 用标准库确定性打包（固定
 | `codex_sessions.py` | Codex rollout 元数据读取器（只读，不修改会话文件） |
 | `resume-gui.py` | GUI 表格选择器（tkinter，被引擎自动调用） |
 | `resume-claude-sessions.ps1` · `还原Claude会话.bat` | Windows Claude 版（WinForms GUI） |
-| `resume-codex-sessions.ps1` · `还原Codex会话.bat` | Windows Codex 版（WinForms + 独立控制台，可选 Windows Terminal） |
+| `resume-codex-sessions.ps1` · `还原Codex会话.bat` | Windows Codex 版（WinForms + WezTerm 分组标签页） |
+| `配置运行环境.bat` · `scripts/wezterm.ps1` | Windows 环境准备、共享缓存、下载校验和独立 WezTerm 进程启动 |
+| `config/wezterm.{json,lua}` | 官方下载来源、已验证版本记录和标签页配置 |
 | `comate-bridge/` | Comate 桥接扩展：`extension.js` 与 `lib/{identity,protocol,server}.js` |
 | `bridge/comate_bridge_client.py` | Python 桥接客户端与 CLI |
 | `scripts/package-comate-bridge.py` | 确定性 VSIX 打包 |
@@ -354,6 +373,7 @@ Windows Codex 启动路径回归（拦截进程创建，不打开真实会话）
 
 ```powershell
 python -B -m unittest discover -s tests -p test_codex_launcher_windows.py -v
+python -B -m unittest discover -s tests -p test_wezterm_setup.py -v
 ```
 
 全部为离线测试：使用临时假 socket、假 CLI、假 `CODEX_HOME` 与源码断言，不会调用真实 Comate/Codex/Claude、不安装扩展、不打开或关闭窗口。源码断言会检查代码里不存在 `-r`、`--reuse-window`、reload 命令，以及任何操作已有终端的调用。

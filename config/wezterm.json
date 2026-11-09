@@ -1,0 +1,13 @@
+{
+  "channel": "nightly",
+  "url": "https://github.com/wezterm/wezterm/releases/download/nightly/WezTerm-windows-nightly.zip",
+  "checksum_url": "https://github.com/wezterm/wezterm/releases/download/nightly/WezTerm-windows-nightly.zip.sha256",
+  "minimum_build": "20260608",
+  "tested": {
+    "version": "20261108-035604-458a100c",
+    "sha256": "7a9c46d0d6d0098a8e9f0fdddf2a944fd4d6b3cec894546f0aa33d8d3843753a",
+    "download_bytes": 70875295,
+    "installed_bytes": 201842776
+  },
+  "upstream_ime_fix": "https://github.com/wezterm/wezterm/pull/7529"
+}
