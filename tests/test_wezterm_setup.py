@@ -164,6 +164,95 @@ function Invoke-WezTermDownload {
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0]["Proxy"], "")
 
+    def launch_groups(self, fault="", fail_on=0):
+        body = "$env:RESUME_WEZTERM_HOME=" + ps_literal(self.cache) + "\n"
+        body += "$script:reportFault=" + ps_literal(fault) + "\n"
+        body += f"$script:failOn={fail_on}\n"
+        body += r"""
+foreach ($name in @('WEZTERM_PANE','WEZTERM_UNIX_SOCKET','WEZTERM_CONFIG_FILE','WT_SESSION','WT_PROFILE_ID')) {
+    [Environment]::SetEnvironmentVariable($name, 'stale-parent-value', 'Process')
+}
+function Get-CachedWezTerm { return 'C:\fake terminal\wezterm-gui.exe' }
+$script:launches = New-Object 'System.Collections.Generic.List[object]'
+function Start-WezTermGuiProcess {
+    param($StartInfo)
+    $planPath = $StartInfo.EnvironmentVariables['RESUME_WEZTERM_PLAN']
+    $plan = Get-Content -LiteralPath $planPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $inherited = @{}
+    foreach ($name in @('WEZTERM_PANE','WEZTERM_UNIX_SOCKET','WEZTERM_CONFIG_FILE','WT_SESSION','WT_PROFILE_ID')) {
+        $inherited[$name] = $StartInfo.EnvironmentVariables[$name]
+    }
+    $script:launches.Add(@{
+        file=$StartInfo.FileName; arguments=$StartInfo.Arguments
+        shell=$StartInfo.UseShellExecute; plan=$plan; plan_path=$planPath; inherited=$inherited
+    })
+    $reportedGroups = @($plan.groups | ForEach-Object {
+        @{name=$_.name; tab_count=$_.tabs.Count; window_id=0}
+    })
+    if ($script:reportFault -eq 'name') { $reportedGroups[0].name = 'wrong-group' }
+    if ($script:reportFault -eq 'tabs') { $reportedGroups[0].tab_count++ }
+    if ($script:reportFault -eq 'windows') { $reportedGroups += $reportedGroups[0] }
+    $report = @{ok=$true; groups=@($reportedGroups)}
+    if ($script:launches.Count -eq $script:failOn) { $report.ok=$false; $report.error='fixture failure' }
+    [IO.File]::WriteAllText($plan.report, (ConvertTo-Json -InputObject $report -Depth 8), [Text.UTF8Encoding]::new($false))
+    [pscustomobject]@{Id=(1000 + $script:launches.Count); HasExited=$false}
+}
+$groups = @(
+    @{name='1'; tabs=@(
+        @{title='one'; cwd="C:\test space's"; args=@('powershell.exe','-NoProfile')},
+        @{title='one +CLI'; cwd="C:\test space's"; args=@('powershell.exe','-NoProfile')}
+    )},
+    @{name='single-two'; tabs=@(
+        @{title='two'; cwd='C:\test-two'; args=@('powershell.exe','-NoProfile')}
+    )}
+)
+$failure = $null
+try { Start-CodexWezTerm -Groups $groups }
+catch { $failure = $_.Exception.Message }
+$lastRun = $null
+$marker = Join-Path $env:RESUME_WEZTERM_HOME 'last-run.json'
+if (Test-Path -LiteralPath $marker) { $lastRun = Get-Content -LiteralPath $marker -Raw -Encoding UTF8 | ConvertFrom-Json }
+ConvertTo-Json -InputObject @{launches=@($script:launches.ToArray()); last_run=$lastRun; failure=$failure} -Depth 12 -Compress
+"""
+        result = self.run_ps(body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_separate_windows_get_independent_processes_and_keep_grouped_tabs(self):
+        result = self.launch_groups()
+        self.assertIsNone(result["failure"])
+        launches = result["launches"]
+        self.assertEqual(len(launches), 2)
+        self.assertEqual([len(launch["plan"]["groups"]) for launch in launches], [1, 1])
+        self.assertEqual([len(launch["plan"]["groups"][0]["tabs"]) for launch in launches], [2, 1])
+        self.assertNotEqual(launches[0]["plan_path"], launches[1]["plan_path"])
+        self.assertNotEqual(launches[0]["plan"]["report"], launches[1]["plan"]["report"])
+        self.assertEqual(launches[0]["plan"]["groups"][0]["tabs"][0]["cwd"], "C:\\test space's")
+        for launch in launches:
+            self.assertEqual(launch["file"], "C:\\fake terminal\\wezterm-gui.exe")
+            self.assertIn("start --always-new-process", launch["arguments"])
+            self.assertIn('--config-file "' + str(ROOT / 'config/wezterm.lua') + '"', launch["arguments"])
+            self.assertFalse(launch["shell"])
+            self.assertTrue(all(value is None for value in launch["inherited"].values()))
+        self.assertEqual([window["pid"] for window in result["last_run"]["windows"]], [1001, 1002])
+        self.assertEqual([window["group"] for window in result["last_run"]["windows"]], ["1", "single-two"])
+
+    def test_incorrect_startup_reports_are_rejected(self):
+        for fault in ("name", "tabs", "windows"):
+            with self.subTest(fault=fault):
+                self.cache = self.fixture / fault
+                result = self.launch_groups(fault=fault)
+                self.assertIsNotNone(result["failure"])
+                self.assertEqual(len(result["launches"]), 1)
+                self.assertIsNone(result["last_run"])
+
+    def test_later_launch_failure_preserves_record_of_first_window(self):
+        result = self.launch_groups(fail_on=2)
+        self.assertIn("fixture failure", result["failure"])
+        self.assertEqual(len(result["launches"]), 2)
+        self.assertEqual(len(result["last_run"]["windows"]), 1)
+        self.assertEqual(result["last_run"]["windows"][0]["group"], "1")
+
     def test_setup_entry_and_powershell_scripts_keep_windows_encoding(self):
         paths = [ROOT / "resume-codex-sessions.ps1", ROOT / "scripts/wezterm.ps1"]
         for path in paths:

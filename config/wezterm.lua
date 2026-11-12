@@ -36,6 +36,9 @@ wezterm.on('gui-startup', function()
   local report = { ok = false, groups = {} }
   local ok, err = xpcall(function()
     assert(plan.schema == 1, 'Unsupported launcher plan')
+    -- Windows shares the default IME context within a GUI thread. The launcher
+    -- must give each window its own process, even when several groups open.
+    assert(#plan.groups == 1, 'Each process must own exactly one window group')
     for _, group in ipairs(plan.groups) do
       assert(#group.tabs > 0, 'Empty tab group')
       local first = group.tabs[1]

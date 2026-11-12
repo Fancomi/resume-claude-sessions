@@ -200,40 +200,51 @@ function Install-WezTermPortable([string]$HomePath, [string]$DownloadProxy, [swi
     throw ('无法下载 WezTerm。请检查 GitHub Releases 连接、使用 -Proxy 指定代理，或导入离线 ZIP。最后错误：' + $lastFailure)
 }
 
+function Start-WezTermGuiProcess([Diagnostics.ProcessStartInfo]$StartInfo) {
+    [Diagnostics.Process]::Start($StartInfo)
+}
+
 function Start-CodexWezTerm($Groups) {
     $homePath = Get-WezTermHome
     $gui = Get-CachedWezTerm $homePath
     if (-not $gui) { $gui = Get-ExistingWezTerm (Get-WezTermSettings) }
     if (-not $gui) { throw 'WezTerm 尚未配置，请先运行“配置运行环境.bat”。' }
-    $run = Join-Path $homePath ('runs\' + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $run -Force | Out-Null
-    $planPath = Join-Path $run 'plan.json'
-    $reportPath = Join-Path $run 'started.json'
-    $plan = [ordered]@{ schema=1; groups=@($Groups); report=$reportPath }
-    [IO.File]::WriteAllText($planPath, (ConvertTo-Json -InputObject $plan -Depth 8), [Text.UTF8Encoding]::new($false))
-    $config = Join-Path $script:WezTermSourceRoot 'config\wezterm.lua'
-    $info = [Diagnostics.ProcessStartInfo]::new()
-    $info.FileName = $gui
-    $info.UseShellExecute = $false
-    $info.Arguments = '--config-file "' + $config + '" start --always-new-process --class ResumeCodexWezTerm'
-    foreach ($name in @('WEZTERM_PANE','WEZTERM_UNIX_SOCKET','WEZTERM_CONFIG_FILE','WT_SESSION','WT_PROFILE_ID')) { $info.EnvironmentVariables.Remove($name) }
-    $info.EnvironmentVariables['RESUME_WEZTERM_PLAN'] = $planPath
-    $process = [Diagnostics.Process]::Start($info)
-    $deadline = [DateTime]::UtcNow.AddSeconds(25)
-    while (-not (Test-Path -LiteralPath $reportPath) -and -not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
-        Start-Sleep -Milliseconds 100
+    # Windows' default IME context is shared by windows on the same GUI thread.
+    # Keep separate windows in separate processes so candidate positions cannot
+    # overwrite one another; tabs belonging to one group still share a window.
+    $windows = @()
+    foreach ($group in $Groups) {
+        $run = Join-Path $homePath ('runs\' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $run -Force | Out-Null
+        $planPath = Join-Path $run 'plan.json'
+        $reportPath = Join-Path $run 'started.json'
+        $plan = [ordered]@{ schema=1; groups=@($group); report=$reportPath }
+        [IO.File]::WriteAllText($planPath, (ConvertTo-Json -InputObject $plan -Depth 8), [Text.UTF8Encoding]::new($false))
+        $config = Join-Path $script:WezTermSourceRoot 'config\wezterm.lua'
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $gui
+        $info.UseShellExecute = $false
+        $info.Arguments = '--config-file "' + $config + '" start --always-new-process --class ResumeCodexWezTerm'
+        foreach ($name in @('WEZTERM_PANE','WEZTERM_UNIX_SOCKET','WEZTERM_CONFIG_FILE','WT_SESSION','WT_PROFILE_ID')) { $info.EnvironmentVariables.Remove($name) }
+        $info.EnvironmentVariables['RESUME_WEZTERM_PLAN'] = $planPath
+        $process = Start-WezTermGuiProcess -StartInfo $info
+        $deadline = [DateTime]::UtcNow.AddSeconds(25)
+        while (-not (Test-Path -LiteralPath $reportPath) -and -not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not (Test-Path -LiteralPath $reportPath)) {
+            $detail = if ($process.HasExited) { '退出码：' + $process.ExitCode } else { '等待超时' }
+            throw ('WezTerm 未确认标签页启动，' + $detail)
+        }
+        $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $report.ok) { throw ('WezTerm 启动失败：' + $report.error) }
+        if ($report.groups.Count -ne 1 -or $report.groups[0].name -ne $group.name) { throw 'WezTerm 窗口分组不匹配。' }
+        if ($report.groups[0].tab_count -ne $group.tabs.Count) { throw 'WezTerm 标签页数量不匹配。' }
+        $windows += [ordered]@{pid=$process.Id; report=$reportPath; group=$group.name}
+        # Record each confirmed window, including a partial launch if a later one fails.
+        [IO.File]::WriteAllText((Join-Path $homePath 'last-run.json'),
+            (ConvertTo-Json -InputObject @{schema=2; windows=@($windows)} -Depth 5), [Text.UTF8Encoding]::new($false))
     }
-    if (-not (Test-Path -LiteralPath $reportPath)) {
-        $detail = if ($process.HasExited) { '退出码：' + $process.ExitCode } else { '等待超时' }
-        throw ('WezTerm 未确认标签页启动，' + $detail)
-    }
-    $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if (-not $report.ok) { throw ('WezTerm 启动失败：' + $report.error) }
-    if ($report.groups.Count -ne @($Groups).Count) { throw 'WezTerm 窗口分组数量不匹配。' }
-    for ($index=0; $index -lt @($Groups).Count; $index++) {
-        if ($report.groups[$index].tab_count -ne $Groups[$index].tabs.Count) { throw 'WezTerm 标签页数量不匹配。' }
-    }
-    [IO.File]::WriteAllText((Join-Path $homePath 'last-run.json'), (ConvertTo-Json @{pid=$process.Id; report=$reportPath}), [Text.UTF8Encoding]::new($false))
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
