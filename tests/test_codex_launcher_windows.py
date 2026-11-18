@@ -50,7 +50,9 @@ function Get-CodexSessions {
 }
 function Get-CodexRunningIds { return @{} }
 function Show-CodexSessionPicker {
-    param($Sessions, $RunningIds)
+    param($Sessions, $RunningIds, $SessionsRoot, $IncludeSubagents)
+    if (@($Sessions).Count -ne 0) { throw 'Interactive picker must start without a full scan' }
+    $Sessions = @(Get-CodexSessions)
     [pscustomobject]@{ Session=$Sessions[0]; Group='1'; Cli=$true }
     $secondGroup = if ($script:separate) { 'single-two' } else { '1' }
     [pscustomobject]@{ Session=$Sessions[1]; Group=$secondGroup; Cli=$false }

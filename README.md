@@ -74,6 +74,8 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\resume-codex-sessions
 
 Windows 版是两套独立的 PowerShell/WinForms 实现，不依赖 Python。Claude 版会跳过命令行里已带 `--resume <id>` 的进程；Codex 版同理识别已打开的会话，默认使用 WezTerm：同组在一个窗口内打开多个标签页，`+CLI` 追加命令行标签。恢复时加 `--no-daemon`。子进程继承已有代理设置；可用 `RESUME_PROXY` 显式指定代理，没有代理设置时会探测本机 7890，端口不可用则保持直连。
 
+Windows Codex 选择窗口会先显示，优先读取近 3 天活动的会话，再在后台加载历史会话；加载期间可以操作和打开已经显示的会话。较早创建、最近才重新使用的会话会在扫描其所在目录后补充显示。界面底部显示扫描进度；需要较早会话时请等扫描完成。`-List` 和 `-AutoSelect` 需要完整结果，仍会先扫描全部会话。
+
 每个 WezTerm 窗口单独启动一个 GUI 进程，窗口内的同组标签页仍然放在一起。Windows 默认会让同一 GUI 线程的多个窗口[共享输入法上下文](https://learn.microsoft.com/en-us/windows/win32/intl/input-context)，分开进程可避免左右并排窗口相互覆盖候选框位置。旧启动器已经打开的窗口需保存工作后关闭，再用 `还原Codex会话.bat` 恢复；仅热重载配置不能拆开已有进程。此隔离适用于启动器创建的独立窗口，手动把标签页移到新窗口仍可能共用原进程。
 
 WezTerm 是首次下载的外部依赖：仓库只保存安装脚本和配置，clone 不携带二进制。已验证的包下载约 **70.9 MB**、解压约 **201.8 MB**；共享缓存默认在 `%LOCALAPPDATA%\resume-claude-sessions\wezterm`，多个 clone 复用同一份安装。启动器也能识别 PATH 上足够新的 WezTerm。下载和安装由环境配置入口完成；恢复入口只使用已准备的终端，缺少时提示先配置，不自动下载或更新。

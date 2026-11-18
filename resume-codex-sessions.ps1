@@ -24,50 +24,118 @@ function Test-CodexSubagent($Source) {
     return $false
 }
 
+function Get-CodexSessionFile([System.IO.FileInfo]$File, [switch]$IncludeSubagents) {
+    $reader = $null
+    $stream = $null
+    try {
+        # Allow Codex to keep writing while the picker reads metadata.
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.File]::Open($File.FullName, 'Open', 'Read', $share)
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true)
+        for ($lineNumber = 0; $lineNumber -lt 64 -and -not $reader.EndOfStream; $lineNumber++) {
+            $line = $reader.ReadLine()
+            try { $record = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            if ($record.type -ne 'session_meta' -or $null -eq $record.payload) { continue }
+            $meta = $record.payload
+            if (-not $IncludeSubagents -and ((Test-CodexSubagent $meta.source) -or (Test-CodexSubagent $meta.thread_source))) { break }
+            $id = if ($meta.id) { [string]$meta.id } else { [string]$meta.session_id }
+            if (-not $id -and $File.BaseName -match '([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$') { $id = $matches[1] }
+            $parsedId = [guid]::Empty
+            if (-not [guid]::TryParseExact($id, 'D', [ref]$parsedId)) { break }
+            $cwd = $meta.cwd
+            if ($cwd -isnot [string] -or -not [System.IO.Path]::IsPathRooted($cwd) -or -not (Test-Path -LiteralPath $cwd -PathType Container)) { break }
+            return [pscustomobject]@{
+                Id = $parsedId.ToString()
+                Cwd = $cwd
+                Name = $(if (Split-Path -Path $cwd -Leaf) { Split-Path -Path $cwd -Leaf } else { $cwd })
+                LastSeen = $File.LastWriteTime
+            }
+        }
+    } catch {
+        # Skip files that disappeared, are unreadable, or contain invalid metadata.
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        elseif ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Add-CodexScannedSession($ById, $File, [switch]$IncludeSubagents) {
+    $session = Get-CodexSessionFile -File $File -IncludeSubagents:$IncludeSubagents
+    if ($null -ne $session -and (-not $ById.ContainsKey($session.Id) -or $session.LastSeen -gt $ById[$session.Id].LastSeen)) {
+        $ById[$session.Id] = $session
+    }
+}
+
 function Get-CodexSessions([string]$SessionsRoot, [switch]$IncludeSubagents) {
     if (-not (Test-Path -LiteralPath $SessionsRoot -PathType Container)) {
         throw "Sessions directory not found: $SessionsRoot"
     }
     $byId = @{}
-    $files = Get-ChildItem -LiteralPath $SessionsRoot -Recurse -Filter '*.jsonl' -File -ErrorAction SilentlyContinue
-    foreach ($file in $files) {
-        $reader = $null
-        $stream = $null
-        try {
-            # Allow Codex to keep writing while the picker reads metadata.
-            $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
-            $stream = [System.IO.File]::Open($file.FullName, 'Open', 'Read', $share)
-            $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true)
-            for ($lineNumber = 0; $lineNumber -lt 64 -and -not $reader.EndOfStream; $lineNumber++) {
-                $line = $reader.ReadLine()
-                try { $record = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
-                if ($record.type -ne 'session_meta' -or $null -eq $record.payload) { continue }
-                $meta = $record.payload
-                if (-not $IncludeSubagents -and ((Test-CodexSubagent $meta.source) -or (Test-CodexSubagent $meta.thread_source))) { break }
-                $id = if ($meta.id) { [string]$meta.id } else { [string]$meta.session_id }
-                if (-not $id -and $file.BaseName -match '([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$') { $id = $matches[1] }
-                $parsedId = [guid]::Empty
-                if (-not [guid]::TryParseExact($id, 'D', [ref]$parsedId)) { break }
-                $id = $parsedId.ToString()
-                $cwd = $meta.cwd
-                if ($cwd -isnot [string] -or -not [System.IO.Path]::IsPathRooted($cwd) -or -not (Test-Path -LiteralPath $cwd -PathType Container)) { break }
-                $session = [pscustomobject]@{
-                    Id = $id
-                    Cwd = $cwd
-                    Name = $(if (Split-Path -Path $cwd -Leaf) { Split-Path -Path $cwd -Leaf } else { $cwd })
-                    LastSeen = $file.LastWriteTime
-                }
-                if (-not $byId.ContainsKey($id) -or $session.LastSeen -gt $byId[$id].LastSeen) { $byId[$id] = $session }
-                break
-            }
-        } catch {
-            # Skip files that disappeared, are unreadable, or contain invalid metadata.
-        } finally {
-            if ($null -ne $reader) { $reader.Dispose() }
-            elseif ($null -ne $stream) { $stream.Dispose() }
-        }
+    Get-ChildItem -LiteralPath $SessionsRoot -Recurse -Filter '*.jsonl' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        Add-CodexScannedSession -ById $byId -File $_ -IncludeSubagents:$IncludeSubagents
     }
     $byId.Values | Sort-Object @{Expression='LastSeen'; Descending=$true}, Id
+}
+
+function Start-CodexSessionScan([string]$SessionsRoot, [bool]$IncludeSubagents, $Queue, $Control) {
+    # A separate runspace keeps disk access and JSON parsing off the WinForms thread.
+    $worker = [powershell]::Create()
+    $scriptPath = $PSCommandPath
+    $body = {
+        param($ScriptPath, $Root, $IncludeAgents, $Queue, $Control)
+        try {
+            . $ScriptPath
+            if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw "Sessions directory not found: $Root" }
+            $byId = @{}
+            $seen = @{}
+            $older = New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'
+            $cutoff = (Get-Date).AddDays(-3)
+            $folders = @{}
+            # Codex normally stores rollouts under their creation date in UTC.
+            # Cover both local and UTC dates; older rollouts may still be active.
+            foreach ($base in @((Get-Date).Date, (Get-Date).ToUniversalTime().Date)) {
+                for ($day = 0; $day -le 3; $day++) {
+                    $date = $base.AddDays(-$day)
+                    $folder = Join-Path (Join-Path (Join-Path $Root $date.ToString('yyyy')) $date.ToString('MM')) $date.ToString('dd')
+                    $folders[$folder] = $true
+                }
+            }
+            foreach ($folder in $folders.Keys) {
+                if ($Control.Cancelled) { throw [System.OperationCanceledException]::new() }
+                if (-not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+                Get-ChildItem -LiteralPath $folder -Recurse -Filter '*.jsonl' -File -ErrorAction SilentlyContinue | ForEach-Object {
+                    if ($Control.Cancelled) { throw [System.OperationCanceledException]::new() }
+                    if ($_.LastWriteTime -ge $cutoff) {
+                        $seen[$_.FullName] = $true
+                        Add-CodexScannedSession -ById $byId -File $_ -IncludeSubagents:$IncludeAgents
+                    }
+                }
+            }
+            $Queue.Enqueue([pscustomobject]@{ Kind='quick'; Sessions=@($byId.Values | Sort-Object @{Expression='LastSeen'; Descending=$true}, Id) })
+            # An old creation-date directory can contain a recently resumed session.
+            # Find those before reading the older files, regardless of folder layout.
+            Get-ChildItem -LiteralPath $Root -Recurse -Filter '*.jsonl' -File -ErrorAction SilentlyContinue | ForEach-Object {
+                if ($Control.Cancelled) { throw [System.OperationCanceledException]::new() }
+                if ($seen.ContainsKey($_.FullName)) { return }
+                if ($_.LastWriteTime -ge $cutoff) {
+                    Add-CodexScannedSession -ById $byId -File $_ -IncludeSubagents:$IncludeAgents
+                } else { $older.Add($_) }
+            }
+            $Queue.Enqueue([pscustomobject]@{ Kind='recent'; Sessions=@($byId.Values | Sort-Object @{Expression='LastSeen'; Descending=$true}, Id) })
+            foreach ($file in $older) {
+                if ($Control.Cancelled) { throw [System.OperationCanceledException]::new() }
+                Add-CodexScannedSession -ById $byId -File $file -IncludeSubagents:$IncludeAgents
+            }
+            $Queue.Enqueue([pscustomobject]@{ Kind='complete'; Sessions=@($byId.Values | Sort-Object @{Expression='LastSeen'; Descending=$true}, Id) })
+        } catch [System.OperationCanceledException] {
+            # Closing the picker cancels further work.
+        } catch {
+            $Queue.Enqueue([pscustomobject]@{ Kind='error'; Message=$_.Exception.Message })
+        }
+    }
+    [void]$worker.AddScript($body.ToString()).AddArgument($scriptPath).AddArgument($SessionsRoot).AddArgument($IncludeSubagents).AddArgument($Queue).AddArgument($Control)
+    $handle = $worker.BeginInvoke()
+    return [pscustomobject]@{ PowerShell=$worker; Handle=$handle }
 }
 
 function Get-CodexRunningIds {
@@ -111,7 +179,66 @@ function Get-CodexDateLabel([datetime]$Date) {
     return $Date.ToString('yyyy-MM-dd  dddd')
 }
 
-function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [switch]$BuildOnly) {
+function Update-CodexPickerSessions($State, [object[]]$Sessions) {
+    $grid = $State.Grid
+    $previous = @{}
+    foreach ($row in $grid.Rows) {
+        if ($row.Tag -ne 'HEADER') {
+            $previous[$row.Tag.Id] = @{
+                Open=($row.Cells['Open'].Value -eq $true)
+                Group=$row.Cells['Group'].Value
+                Cli=($row.Cells['Cli'].Value -eq $true)
+            }
+        }
+    }
+    $State.Rebuilding = $true
+    try {
+        $grid.Rows.Clear()
+        $latestDate = if ($Sessions.Count) { $Sessions[0].LastSeen.Date } else { $null }
+        $lastDate = $null
+        $header = $null
+        $allChecked = $true
+        foreach ($session in $Sessions) {
+            $date = $session.LastSeen.Date
+            $dateKey = $date.ToString('yyyy-MM-dd')
+            if ($date -ne $lastDate) {
+                if ($null -ne $header) { $header.Cells['Open'].Value = $allChecked }
+                $lastDate = $date
+                $allChecked = $true
+                if (-not $State.DateGroups.ContainsKey($dateKey)) {
+                    $State.NextGroup++
+                    $State.DateGroups[$dateKey] = $State.NextGroup.ToString()
+                }
+                $header = $grid.Rows[$grid.Rows.Add()]
+                $header.Tag = 'HEADER'
+                $header.Cells['Cwd'].Value = Get-CodexDateLabel $date
+                $header.Cells['Group'].ReadOnly = $true
+                $header.Cells['Cli'].ReadOnly = $true
+                $header.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(230, 236, 245)
+            }
+            $old = $previous[$session.Id]
+            $row = $grid.Rows[$grid.Rows.Add()]
+            $row.Tag = $session
+            $isOpen = switch ($State.SelectionMode) {
+                'all' { $true }
+                'none' { $false }
+                'custom' { $null -ne $old -and $old.Open }
+                default { $date -eq $latestDate -and -not $State.RunningIds.ContainsKey($session.Id) }
+            }
+            $row.Cells['Open'].Value = $isOpen
+            if (-not $isOpen) { $allChecked = $false }
+            $row.Cells['Cwd'].Value = $session.Cwd + '  [' + $session.Id.Substring(0, 8) + ']'
+            $row.Cells['Cwd'].ToolTipText = $session.Id
+            $row.Cells['Time'].Value = $session.LastSeen.ToString('MM-dd HH:mm:ss')
+            $row.Cells['Group'].Value = if ($null -ne $old) { $old.Group } else { $State.DateGroups[$dateKey] }
+            $row.Cells['Cli'].Value = if ($null -ne $old) { $old.Cli } else { $false }
+            $row.Cells['Status'].Value = $(if ($State.RunningIds.ContainsKey($session.Id)) { '已打开' } else { '可恢复' })
+        }
+        if ($null -ne $header) { $header.Cells['Open'].Value = $allChecked }
+    } finally { $State.Rebuilding = $false }
+}
+
+function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [switch]$BuildOnly, [string]$SessionsRoot, [switch]$IncludeSubagents) {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -150,51 +277,25 @@ function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [s
         [void]$grid.Columns.Add($column)
     }
     $form.Controls.Add($grid)
-    $latestDate = $Sessions[0].LastSeen.Date
-    $lastDate = $null
-    $groupNumber = 0
-    foreach ($session in $Sessions) {
-        if ($session.LastSeen.Date -ne $lastDate) {
-            $lastDate = $session.LastSeen.Date
-            $groupNumber++
-            $header = $grid.Rows[$grid.Rows.Add()]
-            $header.Tag = 'HEADER'
-            $header.Cells['Open'].Value = $false
-            $header.Cells['Cwd'].Value = Get-CodexDateLabel $lastDate
-            $header.Cells['Group'].ReadOnly = $true
-            $header.Cells['Cli'].ReadOnly = $true
-            $header.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(230, 236, 245)
-        }
-        $row = $grid.Rows[$grid.Rows.Add()]
-        $row.Tag = $session
-        $row.Cells['Open'].Value = ($session.LastSeen.Date -eq $latestDate -and -not $RunningIds.ContainsKey($session.Id))
-        $row.Cells['Cwd'].Value = $session.Cwd + '  [' + $session.Id.Substring(0, 8) + ']'
-        $row.Cells['Cwd'].ToolTipText = $session.Id
-        $row.Cells['Time'].Value = $session.LastSeen.ToString('MM-dd HH:mm:ss')
-        $row.Cells['Group'].Value = $groupNumber.ToString()
-        $row.Cells['Cli'].Value = $false
-        $row.Cells['Status'].Value = $(if ($RunningIds.ContainsKey($session.Id)) { '已打开' } else { '可恢复' })
+    $state = @{
+        Grid=$grid; RunningIds=$RunningIds; Rebuilding=$false; SelectionMode='default'
+        DateGroups=@{}; NextGroup=0; Queue=$null; Control=$null; Worker=$null; Pending=$null; ScanError=$null
     }
-    # Initialize each date header using its actual child selections.
-    $header = $null
-    $allChecked = $true
-    foreach ($row in $grid.Rows) {
-        if ($row.Tag -eq 'HEADER') {
-            if ($null -ne $header) { $header.Cells['Open'].Value = $allChecked }
-            $header = $row
-            $allChecked = $true
-        } elseif ($row.Cells['Open'].Value -ne $true) { $allChecked = $false }
-    }
-    if ($null -ne $header) { $header.Cells['Open'].Value = $allChecked }
+    $form.Tag = $state
+    Update-CodexPickerSessions -State $state -Sessions $Sessions
     $grid.Add_CellValueChanged({
         param($sender, $eventArgs)
-        if ($eventArgs.RowIndex -lt 0 -or $eventArgs.ColumnIndex -ne 0) { return }
+        if ($state.Rebuilding -or $eventArgs.RowIndex -lt 0 -or $eventArgs.ColumnIndex -ne 0) { return }
+        $state.SelectionMode = 'custom'
         $row = $sender.Rows[$eventArgs.RowIndex]
         if ($row.Tag -ne 'HEADER') { return }
-        for ($index = $eventArgs.RowIndex + 1; $index -lt $sender.Rows.Count; $index++) {
-            if ($sender.Rows[$index].Tag -eq 'HEADER') { break }
-            $sender.Rows[$index].Cells['Open'].Value = ($row.Cells['Open'].Value -eq $true)
-        }
+        $state.Rebuilding = $true
+        try {
+            for ($index = $eventArgs.RowIndex + 1; $index -lt $sender.Rows.Count; $index++) {
+                if ($sender.Rows[$index].Tag -eq 'HEADER') { break }
+                $sender.Rows[$index].Cells['Open'].Value = ($row.Cells['Open'].Value -eq $true)
+            }
+        } finally { $state.Rebuilding = $false }
     })
     $grid.Add_CurrentCellDirtyStateChanged({
         if ($grid.IsCurrentCellDirty) { [void]$grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) }
@@ -203,14 +304,29 @@ function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [s
     $selectAll.Text = '全选'
     $selectAll.SetBounds(12, 598, 80, 30)
     $selectAll.Anchor = 'Bottom,Left'
-    $selectAll.Add_Click({ foreach ($row in $grid.Rows) { $row.Cells['Open'].Value = $true } })
+    $selectAll.Add_Click({
+        $state.Rebuilding = $true
+        try { foreach ($row in $grid.Rows) { $row.Cells['Open'].Value = $true } }
+        finally { $state.Rebuilding = $false }
+        $state.SelectionMode = 'all'
+    })
     $form.Controls.Add($selectAll)
     $selectNone = New-Object System.Windows.Forms.Button
     $selectNone.Text = '全不选'
     $selectNone.SetBounds(100, 598, 80, 30)
     $selectNone.Anchor = 'Bottom,Left'
-    $selectNone.Add_Click({ foreach ($row in $grid.Rows) { $row.Cells['Open'].Value = $false } })
+    $selectNone.Add_Click({
+        $state.Rebuilding = $true
+        try { foreach ($row in $grid.Rows) { $row.Cells['Open'].Value = $false } }
+        finally { $state.Rebuilding = $false }
+        $state.SelectionMode = 'none'
+    })
     $form.Controls.Add($selectNone)
+    $status = New-Object System.Windows.Forms.Label
+    $status.SetBounds(190, 604, 670, 24)
+    $status.Anchor = 'Bottom,Left,Right'
+    $status.Text = if ($SessionsRoot) { '正在扫描近 3 天的会话…' } else { '' }
+    $form.Controls.Add($status)
     $open = New-Object System.Windows.Forms.Button
     $open.Text = '打开选中会话'
     $open.SetBounds(870, 598, 130, 30)
@@ -226,6 +342,45 @@ function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [s
     $form.Controls.Add($cancel)
     $form.CancelButton = $cancel
     if ($BuildOnly) { return $form }
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 200
+    $timer.Add_Tick({
+        $message = $null
+        while ($state.Queue.TryDequeue([ref]$message)) {
+            if ($message.Kind -eq 'error') {
+                $state.ScanError = $message.Message
+            } else { $state.Pending = $message }
+            $message = $null
+        }
+        # A checkbox stays in edit mode while focused; only defer for a group
+        # text edit so normal focus does not stop background results appearing.
+        $editingGroup = $grid.IsCurrentCellInEditMode -and $null -ne $grid.CurrentCell -and $grid.CurrentCell.OwningColumn.Name -eq 'Group'
+        if ($null -eq $state.Pending -or $editingGroup) {
+            if ($state.ScanError) { $status.Text = '扫描失败：' + $state.ScanError }
+            return
+        }
+        $message = $state.Pending
+        $state.Pending = $null
+        [void]$grid.EndEdit()
+        Update-CodexPickerSessions -State $state -Sessions $message.Sessions
+        $count = $message.Sessions.Count
+        $status.Text = switch ($message.Kind) {
+            'quick' { "已显示近期目录中的会话；正在后台扫描其他目录（$count 条）…" }
+            'recent' { "近 3 天扫描完成；正在后台读取更早会话（$count 条）…" }
+            'complete' { "扫描完成，共 $count 条会话。" }
+        }
+        if ($state.ScanError) { $status.Text = '扫描失败：' + $state.ScanError }
+    })
+    if ($SessionsRoot) {
+        $form.Add_Shown({
+            $state.Queue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+            $state.Control = [hashtable]::Synchronized(@{ Cancelled=$false })
+            try {
+                $state.Worker = Start-CodexSessionScan -SessionsRoot $SessionsRoot -IncludeSubagents ([bool]$IncludeSubagents) -Queue $state.Queue -Control $state.Control
+                $timer.Start()
+            } catch { $status.Text = '无法启动扫描：' + $_.Exception.Message }
+        })
+    }
     try {
         if ($form.ShowDialog() -ne 'OK') { return }
         [void]$grid.EndEdit()
@@ -237,7 +392,20 @@ function Show-CodexSessionPicker([object[]]$Sessions, [hashtable]$RunningIds, [s
             else { $group = 'single-' + $row.Tag.Id }
             [pscustomobject]@{ Session=$row.Tag; Group=$group; Cli=($row.Cells['Cli'].Value -eq $true) }
         }
-    } finally { $form.Dispose() }
+    } finally {
+        $timer.Stop()
+        $timer.Dispose()
+        if ($null -ne $state.Control) { $state.Control.Cancelled = $true }
+        if ($null -ne $state.Worker) {
+            try {
+                if ($state.Worker.Handle.IsCompleted) {
+                    [void]$state.Worker.PowerShell.EndInvoke($state.Worker.Handle)
+                    $state.Worker.PowerShell.Dispose()
+                } else { [void]$state.Worker.PowerShell.BeginStop($null, $null) }
+            } catch { }
+        }
+        $form.Dispose()
+    }
 }
 
 function Invoke-CodexResume {
@@ -248,11 +416,14 @@ function Invoke-CodexResume {
     if (-not $sessionHome) { $sessionHome = Join-Path $env:USERPROFILE '.codex' }
     $sessionHome = [System.IO.Path]::GetFullPath($sessionHome)
     $includeAgents = $IncludeSubagents -or $env:RESUME_INCLUDE_SUBAGENTS -eq '1'
-    $sessions = @(Get-CodexSessions -SessionsRoot (Join-Path $sessionHome 'sessions') -IncludeSubagents:$includeAgents)
-    if ($List) { ConvertTo-Json -InputObject $sessions -Depth 4; return }
-    if ($sessions.Count -eq 0) { Write-Host "没有找到可恢复的 Codex 会话：$sessionHome\sessions"; return }
+    $sessionsRoot = Join-Path $sessionHome 'sessions'
     $preview = $DryRun -or $env:RESUME_DRY_RUN -eq '1'
     $automatic = $AutoSelect -or $env:RESUME_AUTO_SELECT -eq '1'
+    # Noninteractive modes need a complete result before making a decision.
+    $sessions = @()
+    if ($List -or $automatic) { $sessions = @(Get-CodexSessions -SessionsRoot $sessionsRoot -IncludeSubagents:$includeAgents) }
+    if ($List) { ConvertTo-Json -InputObject $sessions -Depth 4; return }
+    if ($automatic -and $sessions.Count -eq 0) { Write-Host "没有找到可恢复的 Codex 会话：$sessionsRoot"; return }
     # Unattended by default, matching the macOS/Linux launcher.
     # RESUME_SKIP_PERMISSIONS=0 falls back to Codex's own defaults;
     # -SkipPermissions is still accepted as an explicit opt-in.
@@ -275,7 +446,7 @@ function Invoke-CodexResume {
         $chosen = @($sessions | Where-Object { $_.LastSeen.Date -eq $latestDate -and -not $runningIds.ContainsKey($_.Id) } | ForEach-Object {
             [pscustomobject]@{ Session=$_; Group='1'; Cli=$false }
         })
-    } else { $chosen = @(Show-CodexSessionPicker -Sessions $sessions -RunningIds $runningIds) }
+    } else { $chosen = @(Show-CodexSessionPicker -Sessions $sessions -RunningIds $runningIds -SessionsRoot $sessionsRoot -IncludeSubagents:$includeAgents) }
     if ($chosen.Count -eq 0) { Write-Host '未选择任何会话。'; return }
     if ($preview) {
         foreach ($item in $chosen) {
