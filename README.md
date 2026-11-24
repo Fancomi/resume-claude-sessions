@@ -60,11 +60,13 @@ sudo apt install python3-tk
 
 ### Windows
 
-Claude Code：双击 `还原Claude会话.bat`，或：
+Claude Code：首次可运行 `配置运行环境.bat -TerminalOnly` 准备 WezTerm，然后双击 `还原Claude会话.bat`。也可以运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File resume-claude-sessions.ps1
+powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\resume-claude-sessions.ps1
 ```
+
+默认用 `claude` 恢复。勾选「用其他命令代替 claude」后，可输入 PATH 中的命令名（例如 `claude-work`）或程序路径（支持 `.exe`、`.com`、`.cmd`、`.bat`、`.ps1`）。本次选中的会话都会把 `--resume <id>` 传给该命令。`-ClaudeCommand` 可预填输入框。
 
 Codex：首次双击 [`配置运行环境.bat`](配置运行环境.bat)，准备终端并检查已安装的 Codex CLI；随后双击 `还原Codex会话.bat`。也可以运行：
 
@@ -72,11 +74,11 @@ Codex：首次双击 [`配置运行环境.bat`](配置运行环境.bat)，准备
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\resume-codex-sessions.ps1
 ```
 
-Windows 版是两套独立的 PowerShell/WinForms 实现，不依赖 Python。Claude 版会跳过命令行里已带 `--resume <id>` 的进程；Codex 版同理识别已打开的会话，默认使用 WezTerm：同组在一个窗口内打开多个标签页，`+CLI` 追加命令行标签。恢复时加 `--no-daemon`。子进程继承已有代理设置；可用 `RESUME_PROXY` 显式指定代理，没有代理设置时会探测本机 7890，端口不可用则保持直连。
+Windows 版共用 PowerShell/WinForms 选择器和终端窗口逻辑，无需 Python。两者默认使用 WezTerm，同一正整数组号的会话在同一窗口内打开多个标签页，组号为 0 或留空时单独开窗。`+CLI` 在工作目录中额外打开一个命令行标签。已识别为打开的会话默认不勾选。Codex 恢复时加 `--no-daemon`，可用 `RESUME_PROXY` 显式指定代理。Codex 未配置代理时会探测本机 7890，端口不可用则保持直连。
 
-Windows Codex 选择窗口会先显示，优先读取近 3 天活动的会话，再在后台加载历史会话；加载期间可以操作和打开已经显示的会话。较早创建、最近才重新使用的会话会在扫描其所在目录后补充显示。界面底部显示扫描进度；需要较早会话时请等扫描完成。`-List` 和 `-AutoSelect` 需要完整结果，仍会先扫描全部会话。
+Windows 选择窗口会先显示，优先读取近 3 天活动的会话，再在后台加载历史会话。加载期间可以操作和打开已显示的会话，界面底部会显示扫描进度。Codex 较早创建、最近才重新使用的会话会在扫描其所在目录后补充显示。Codex 的 `-List` 和 `-AutoSelect` 会先扫描全部会话。
 
-每个 WezTerm 窗口单独启动一个 GUI 进程，窗口内的同组标签页仍然放在一起。Windows 默认会让同一 GUI 线程的多个窗口[共享输入法上下文](https://learn.microsoft.com/en-us/windows/win32/intl/input-context)，分开进程可避免左右并排窗口相互覆盖候选框位置。旧启动器已经打开的窗口需保存工作后关闭，再用 `还原Codex会话.bat` 恢复；仅热重载配置不能拆开已有进程。此隔离适用于启动器创建的独立窗口，手动把标签页移到新窗口仍可能共用原进程。
+每个 WezTerm 窗口单独启动一个 GUI 进程，窗口内的同组标签页仍然放在一起。Windows 默认会让同一 GUI 线程的多个窗口共享输入法上下文，分开进程可避免左右并排窗口相互覆盖候选框位置。旧启动器已经打开的窗口需保存工作后关闭，再双击对应的恢复入口。手动把标签页移到新窗口仍可能共用原进程。[Windows 输入法上下文文档](https://learn.microsoft.com/en-us/windows/win32/intl/input-context)
 
 WezTerm 是首次下载的外部依赖：仓库只保存安装脚本和配置，clone 不携带二进制。已验证的包下载约 **70.9 MB**、解压约 **201.8 MB**；共享缓存默认在 `%LOCALAPPDATA%\resume-claude-sessions\wezterm`，多个 clone 复用同一份安装。启动器也能识别 PATH 上足够新的 WezTerm。下载和安装由环境配置入口完成；恢复入口只使用已准备的终端，缺少时提示先配置，不自动下载或更新。
 
@@ -93,7 +95,7 @@ WezTerm 是首次下载的外部依赖：仓库只保存安装脚本和配置，
 
 离线导入的 ZIP 必须匹配 [配置清单](config/wezterm.json) 中已验证版本的 SHA-256；也可以从可联网的机器复制整个共享缓存，再用 `RESUME_WEZTERM_HOME` 指向该目录。WezTerm 已准备好后，打开终端和恢复本地会话入口本身无需再次下载；Codex 请求仍使用其自身已配置的服务。环境配置入口检查 Codex CLI 是否存在，不自动安装 CLI 或替用户登录账户。
 
-需要其他终端时，可运行 `还原Codex会话.bat -TerminalHost wt` 或 `-TerminalHost conhost`。相关输入法问题见 [Windows Terminal 上游报告](https://github.com/microsoft/terminal/issues/20481)。
+两个 Windows 恢复入口都接受 `-TerminalHost wt` 或 `-TerminalHost conhost`。[Windows Terminal 输入法问题报告](https://github.com/microsoft/terminal/issues/20481)
 
 ### Comate / VSCode 远程（追加到当前窗口）
 

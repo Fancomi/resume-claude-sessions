@@ -6,7 +6,8 @@ param(
     [switch]$Direct,
     [string]$ArchivePath,
     [switch]$Offline,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$TerminalOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -205,10 +206,17 @@ function Start-WezTermGuiProcess([Diagnostics.ProcessStartInfo]$StartInfo) {
 }
 
 function Start-CodexWezTerm($Groups) {
+    Start-ResumeWezTerm -Groups $Groups -Provider 'Codex'
+}
+
+function Start-ResumeWezTerm($Groups, [ValidateSet('Claude', 'Codex')][string]$Provider) {
     $homePath = Get-WezTermHome
     $gui = Get-CachedWezTerm $homePath
     if (-not $gui) { $gui = Get-ExistingWezTerm (Get-WezTermSettings) }
-    if (-not $gui) { throw 'WezTerm 尚未配置，请先运行“配置运行环境.bat”。' }
+    if (-not $gui) {
+        $setup = if ($Provider -eq 'Claude') { '配置运行环境.bat -TerminalOnly' } else { '配置运行环境.bat' }
+        throw ('WezTerm 尚未配置，请先运行“' + $setup + '”。')
+    }
     # Windows' default IME context is shared by windows on the same GUI thread.
     # Keep separate windows in separate processes so candidate positions cannot
     # overwrite one another; tabs belonging to one group still share a window.
@@ -218,13 +226,13 @@ function Start-CodexWezTerm($Groups) {
         New-Item -ItemType Directory -Path $run -Force | Out-Null
         $planPath = Join-Path $run 'plan.json'
         $reportPath = Join-Path $run 'started.json'
-        $plan = [ordered]@{ schema=1; groups=@($group); report=$reportPath }
+        $plan = [ordered]@{ schema=1; provider=$Provider; groups=@($group); report=$reportPath }
         [IO.File]::WriteAllText($planPath, (ConvertTo-Json -InputObject $plan -Depth 8), [Text.UTF8Encoding]::new($false))
         $config = Join-Path $script:WezTermSourceRoot 'config\wezterm.lua'
         $info = [Diagnostics.ProcessStartInfo]::new()
         $info.FileName = $gui
         $info.UseShellExecute = $false
-        $info.Arguments = '--config-file "' + $config + '" start --always-new-process --class ResumeCodexWezTerm'
+        $info.Arguments = '--config-file "' + $config + '" start --always-new-process --class Resume' + $Provider + 'WezTerm'
         foreach ($name in @('WEZTERM_PANE','WEZTERM_UNIX_SOCKET','WEZTERM_CONFIG_FILE','WT_SESSION','WT_PROFILE_ID')) { $info.EnvironmentVariables.Remove($name) }
         $info.EnvironmentVariables['RESUME_WEZTERM_PLAN'] = $planPath
         $process = Start-WezTermGuiProcess -StartInfo $info
@@ -247,6 +255,68 @@ function Start-CodexWezTerm($Groups) {
     }
 }
 
+function ConvertTo-ResumeLiteral([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
+
+function New-ResumeTabPrelude([string]$WorkingDirectory) {
+    $script = ''
+    # Existing Windows Terminal processes can supply stale environment variables.
+    foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
+        $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+        $literal = if ($null -eq $value) { '$null' } else { ConvertTo-ResumeLiteral $value }
+        $script += '$env:' + $name + ' = ' + $literal + '; '
+    }
+    $script += 'Set-Location -LiteralPath ' + (ConvertTo-ResumeLiteral $WorkingDirectory) + ' -ErrorAction Stop; '
+    return $script
+}
+
+function Start-ResumeSessionWindows($Chosen, [string]$TerminalHost, [scriptblock]$NewTabCommand, [scriptblock]$StartWezTerm) {
+    $windowsTerminal = $null
+    if ($TerminalHost -eq 'wt') {
+        $windowsTerminal = Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue
+        if (-not $windowsTerminal) { throw '找不到 Windows Terminal；可使用默认 WezTerm 或 -TerminalHost conhost。' }
+    }
+    $weztermGroups = @()
+    foreach ($group in ($chosen | Group-Object Group)) {
+        $weztermTabs = @()
+        $arguments = New-Object 'System.Collections.Generic.List[string]'
+        $arguments.Add('-w')
+        $arguments.Add('new')
+        $first = $true
+        foreach ($item in $group.Group) {
+            $shortId = $item.Session.Id.Substring(0, [Math]::Min(8, $item.Session.Id.Length))
+            $tabKinds = @($false)
+            if ($item.Cli) { $tabKinds += $true }
+            foreach ($cli in $tabKinds) {
+                $encoded = & $NewTabCommand $item $cli
+                $shellArgs = @('-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)
+                if ($TerminalHost -eq 'wezterm') {
+                    $title = $item.Session.Name + ' - ' + $shortId
+                    if ($cli) { $title += ' +CLI' }
+                    $weztermTabs += [pscustomobject]@{
+                        title=$title; cwd=$item.Session.Cwd; args=@('powershell.exe') + $shellArgs
+                    }
+                } elseif ($windowsTerminal) {
+                    if (-not $first) { $arguments.Add(';') }
+                    $first = $false
+                    $title = ($item.Session.Name -replace '[^a-zA-Z0-9._-]', '_')
+                    if ($title.Length -gt 32) { $title = $title.Substring(0, 32) }
+                    $title += '-' + $shortId
+                    if ($cli) { $title += '-cli' }
+                    $arguments.AddRange([string[]]@('new-tab', '--title', $title, 'powershell.exe'))
+                    $arguments.AddRange([string[]]$shellArgs)
+                } else {
+                    # Explicit conhost bypasses Windows' default terminal delegation.
+                    $consoleHost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+                    Start-Process -FilePath $consoleHost -ArgumentList (@('powershell.exe') + $shellArgs) | Out-Null
+                }
+            }
+        }
+        if ($TerminalHost -eq 'wezterm') { $weztermGroups += [pscustomobject]@{name=$group.Name; tabs=@($weztermTabs)} }
+        if ($windowsTerminal) { Start-Process -FilePath $windowsTerminal.Source -ArgumentList $arguments.ToArray() | Out-Null }
+    }
+    if ($weztermGroups.Count) { & $StartWezTerm $weztermGroups }
+}
+
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         $homePath = Get-WezTermHome $CacheRoot
@@ -259,6 +329,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         }
         Write-Host ('WezTerm 已就绪：' + $gui)
         Write-Host ('共享缓存：' + $homePath)
+        if ($TerminalOnly) { return }
         $candidates = if ($env:RESUME_CODEX_CMD) { @($env:RESUME_CODEX_CMD) } else { @('codex.exe','codex.cmd','codex.ps1','codex') }
         $codex = Get-Command $candidates -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $codex) { throw 'WezTerm 已准备完成；未检测到 Codex CLI，请先安装并登录 Codex 后再恢复会话。' }

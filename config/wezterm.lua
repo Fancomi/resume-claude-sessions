@@ -53,7 +53,7 @@ wezterm.on('gui-startup', function()
         next_tab:set_title(item.title)
       end
       tab:activate()
-      window:set_title('Codex - ' .. group.name)
+      window:set_title((plan.provider or 'Codex') .. ' - ' .. group.name)
       table.insert(report.groups, {
         name = group.name,
         window_id = window:window_id(),

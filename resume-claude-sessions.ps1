@@ -1,215 +1,155 @@
-﻿# Resume Claude Code sessions. Lists ALL sessions grouped by date (newest first),
-# with the most recent date group ticked by default.
-# GUI: checkbox selection, group-into-one-window (tabs), optional CLI tab,
-# auto-skip sessions that are already open.
+﻿# Windows PowerShell 5.1+. Dot-source to use the functions.
+[CmdletBinding()]
+param(
+    [string]$ClaudeCommand,
+    [ValidateSet('wezterm', 'conhost', 'wt')][string]$TerminalHost = 'wezterm'
+)
 
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+. (Join-Path $PSScriptRoot 'scripts\wezterm.ps1')
+. (Join-Path $PSScriptRoot 'scripts\session-picker.ps1')
 
-$projectsRoot = Join-Path $env:USERPROFILE '.claude\projects'
-$claudeCmd    = Join-Path $env:APPDATA 'npm\claude.cmd'
-
-function Show-Error($msg) {
-    [System.Windows.Forms.MessageBox]::Show($msg, 'Claude Resume', 'OK', 'Error') | Out-Null
-}
-
-function Get-DateLabel($date) {
-    $today = (Get-Date).Date
-    $d     = $date.Date
-    if     ($d -eq $today)             { "今天  ($($d.ToString('yyyy-MM-dd')))" }
-    elseif ($d -eq $today.AddDays(-1)) { "昨天  ($($d.ToString('yyyy-MM-dd')))" }
-    else   { $d.ToString('yyyy-MM-dd  dddd') }
-}
-
-if (-not (Test-Path $projectsRoot)) { Show-Error "Projects dir not found:`n$projectsRoot"; exit 1 }
-if (-not (Test-Path $claudeCmd))    { $claudeCmd = 'claude' }  # fall back to PATH
-
-# --- Discover ALL sessions ---------------------------------------------------
-$sessions = @()
-$files = Get-ChildItem -Path $projectsRoot -Recurse -Filter '*.jsonl' |
-    Where-Object { $_.FullName -notmatch 'subagents' }
-
-foreach ($f in $files) {
-    $cwd = $null
-    foreach ($line in [System.IO.File]::ReadLines($f.FullName)) {
-        if (-not $line.Trim()) { continue }
-        try { $o = $line | ConvertFrom-Json } catch { continue }
-        if (($o.PSObject.Properties.Name -contains 'cwd') -and $o.cwd) { $cwd = $o.cwd; break }
-    }
-    if (-not $cwd -or -not (Test-Path $cwd)) { continue }
-    $sessions += [pscustomobject]@{
-        Id       = $f.BaseName
-        Cwd      = $cwd
-        Name     = Split-Path $cwd -Leaf
-        LastSeen = $f.LastWriteTime
-    }
-}
-$sessions = $sessions | Sort-Object LastSeen -Descending
-
-if ($sessions.Count -eq 0) { Show-Error 'No Claude sessions found.'; exit 0 }
-
-# --- Detect already-running resumed sessions (by --resume <id> cmdline) -------
-$runningIds = @{}
-try {
-    Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" | ForEach-Object {
-        if ($_.CommandLine -match '--resume\s+([0-9a-fA-F-]{36})') { $runningIds[$matches[1]] = $true }
-    }
-} catch { }
-
-# --- Group by date (newest first); newest group is ticked by default ---------
-$newestDate = ($sessions | Select-Object -First 1).LastSeen.Date
-
-# --- Build the selection form ------------------------------------------------
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'Claude Code - Resume sessions (grouped by date)'
-$form.Size = New-Object System.Drawing.Size(780, 560)
-$form.StartPosition = 'CenterScreen'
-$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-
-$lbl = New-Object System.Windows.Forms.Label
-$lbl.Text = "所有会话按日期分组（由近到远），默认勾选最近一组。同一 GROUP 号 = 一个窗口多个标签页（0/留空 = 独立窗口）。" +
-            "+CLI 额外开一个手动命令行标签页。已打开的会话默认不勾选。"
-$lbl.SetBounds(12, 8, 740, 40)
-$form.Controls.Add($lbl)
-
-$grid = New-Object System.Windows.Forms.DataGridView
-$grid.SetBounds(12, 52, 740, 420)
-$grid.Anchor = 'Top,Left,Right,Bottom'
-$grid.AllowUserToAddRows = $false
-$grid.AllowUserToDeleteRows = $false
-$grid.RowHeadersVisible = $false
-$grid.SelectionMode = 'CellSelect'
-$grid.AutoSizeColumnsMode = 'None'
-
-$colOpen  = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
-$colOpen.HeaderText = 'Open'; $colOpen.Width = 45
-$colName  = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colName.HeaderText = 'Session (path)'; $colName.Width = 320; $colName.ReadOnly = $true
-$colTime  = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colTime.HeaderText = 'Last active'; $colTime.Width = 120; $colTime.ReadOnly = $true
-$colGroup = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colGroup.HeaderText = 'Group'; $colGroup.Width = 55
-$colCli   = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
-$colCli.HeaderText = '+CLI'; $colCli.Width = 45
-$colState = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colState.HeaderText = 'Status'; $colState.Width = 110; $colState.ReadOnly = $true
-$grid.Columns.AddRange($colOpen,$colName,$colTime,$colGroup,$colCli,$colState) | Out-Null
-$form.Controls.Add($grid)
-
-# Rows: insert a non-selectable header row per date group, then its sessions.
-$headerBack = [System.Drawing.Color]::FromArgb(230, 236, 245)
-$headerFore = [System.Drawing.Color]::FromArgb(30, 60, 110)
-$i = 0
-$grouped = $sessions | Group-Object { $_.LastSeen.Date } | Sort-Object { [datetime]$_.Name } -Descending
-foreach ($g in $grouped) {
-    $date = [datetime]$g.Name
-
-    $isNewestGroup = ($date -eq $newestDate)
-
-    # date header row (its checkbox toggles all sessions in the group)
-    $hr = $grid.Rows.Add()
-    $hrow = $grid.Rows[$hr]
-    $hrow.Cells[0].Value = $isNewestGroup                # header checkbox = select-all for the group
-    $hrow.Cells[1].Value = (Get-DateLabel $date) + "   —   $($g.Count) 个会话   （点左侧勾选框可全选/全不选本组）"
-    $hrow.Cells[3].ReadOnly = $true
-    $hrow.Cells[4].ReadOnly = $true
-    $hrow.DefaultCellStyle.BackColor = $headerBack
-    $hrow.DefaultCellStyle.ForeColor = $headerFore
-    $hrow.DefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-    $hrow.Tag = 'HEADER'
-
-    foreach ($s in ($g.Group | Sort-Object LastSeen -Descending)) {
-        $isRunning = $runningIds.ContainsKey($s.Id)
-        $status = if ($isRunning) { 'already open' } else { 'closed' }
-        $isNewest = ($s.LastSeen.Date -eq $newestDate)
-        $r = $grid.Rows.Add()
-        $grid.Rows[$r].Cells[0].Value = ($isNewest -and -not $isRunning)   # tick newest group only
-        $grid.Rows[$r].Cells[1].Value = $s.Cwd
-        $grid.Rows[$r].Cells[2].Value = $s.LastSeen.ToString('MM-dd HH:mm')
-        $grid.Rows[$r].Cells[3].Value = $i.ToString()                     # default: unique group per session
-        $grid.Rows[$r].Cells[4].Value = $false                            # +CLI
-        $grid.Rows[$r].Cells[5].Value = $status
-        $grid.Rows[$r].Tag = $s
-        $i++
+function Get-ClaudeSessionFile([System.IO.FileInfo]$File) {
+    $reader = $null
+    $stream = $null
+    try {
+        # A running Claude process can append to the transcript during discovery.
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.File]::Open($File.FullName, 'Open', 'Read', $share)
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true)
+        while (-not $reader.EndOfStream) {
+            $line = $reader.ReadLine()
+            if (-not $line.Trim()) { continue }
+            try { $record = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { continue }
+            $cwd = $record.cwd
+            if ($cwd -isnot [string] -or -not $cwd) { continue }
+            if (-not (Test-Path -LiteralPath $cwd -PathType Container)) { return }
+            $name = Split-Path -Path $cwd -Leaf
+            return [pscustomobject]@{
+                Id=$File.BaseName; Cwd=$cwd; Name=$(if ($name) { $name } else { $cwd }); LastSeen=$File.LastWriteTime
+            }
+        }
+    } catch {
+        # Skip unreadable files and files that disappear during the scan.
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        elseif ($null -ne $stream) { $stream.Dispose() }
     }
 }
 
-# Header checkbox toggles select-all / deselect-all for the sessions under it.
-$grid.Add_CellValueChanged({
-    param($sender, $e)
-    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 0) { return }
-    $row = $sender.Rows[$e.RowIndex]
-    if ($row.Tag -ne 'HEADER') { return }
-    $check = ($row.Cells[0].Value -eq $true)
-    for ($j = $e.RowIndex + 1; $j -lt $sender.Rows.Count; $j++) {
-        $rr = $sender.Rows[$j]
-        if ($rr.Tag -eq 'HEADER') { break }         # reached next date group
-        $rr.Cells[0].Value = $check
-    }
-})
-# Commit checkbox edits immediately so CellValueChanged fires on click.
-$grid.Add_CurrentCellDirtyStateChanged({
-    if ($grid.IsCurrentCellDirty) { $grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) }
-})
-
-$btnOpen = New-Object System.Windows.Forms.Button
-$btnOpen.Text = 'Open selected'
-$btnOpen.SetBounds(580, 482, 110, 30)
-$btnOpen.Anchor = 'Bottom,Right'
-$btnOpen.DialogResult = 'OK'
-$form.Controls.Add($btnOpen)
-$form.AcceptButton = $btnOpen
-
-$btnCancel = New-Object System.Windows.Forms.Button
-$btnCancel.Text = 'Cancel'
-$btnCancel.SetBounds(700, 482, 60, 30)
-$btnCancel.Anchor = 'Bottom,Right'
-$btnCancel.DialogResult = 'Cancel'
-$form.Controls.Add($btnCancel)
-$form.CancelButton = $btnCancel
-
-if ($form.ShowDialog() -ne 'OK') { exit 0 }
-
-# --- Collect chosen rows (skip header rows) ----------------------------------
-$chosen = @()
-foreach ($row in $grid.Rows) {
-    if ($row.Tag -eq 'HEADER' -or $null -eq $row.Tag) { continue }
-    if ($row.Cells[0].Value -ne $true) { continue }
-    $s = $row.Tag
-    $grp = "$($row.Cells[3].Value)".Trim()
-    if (-not $grp) { $grp = [guid]::NewGuid().ToString() }
-    $chosen += [pscustomobject]@{
-        Session = $s
-        Group   = $grp
-        Cli     = ($row.Cells[4].Value -eq $true)
-    }
-}
-if ($chosen.Count -eq 0) { exit 0 }
-
-# --- Launch: one Windows Terminal window per group, one tab per session ------
-# (a group's rows collapse into tabs of a single wt window; +CLI adds a shell tab)
-# Unattended by default, same as the macOS/Linux launcher; set
-# RESUME_SKIP_PERMISSIONS=0 to keep Claude's normal permission prompts.
-$dangerousArg = ' --dangerously-skip-permissions'
-if ($env:RESUME_SKIP_PERMISSIONS -eq '0') { $dangerousArg = '' }
-function Q($s) { '"' + ($s -replace '"','\"') + '"' }
-
-$groups = $chosen | Group-Object Group
-foreach ($g in $groups) {
-    $wtArgs = New-Object System.Collections.Generic.List[string]
-    $first = $true
-    foreach ($item in $g.Group) {
-        $s = $item.Session
-        if (-not $first) { $wtArgs.Add(';') }
-        $first = $false
-        $resume = "$claudeCmd --resume $($s.Id)$dangerousArg"
-        $wtArgs.AddRange([string[]]@('new-tab','--title',$s.Name,'-d',$s.Cwd,'cmd','/k',$resume))
-        if ($item.Cli) {
-            $wtArgs.Add(';')
-            $wtArgs.AddRange([string[]]@('new-tab','--title',"$($s.Name)-cli",'-d',$s.Cwd,'cmd','/k','echo Manual CLI ready'))
+function Start-ClaudeSessionScan([string]$ProjectsRoot, $Queue, $Control) {
+    $worker = [powershell]::Create()
+    $body = {
+        param($ScriptPath, $Root, $Queue, $Control)
+        try {
+            . $ScriptPath
+            if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw "找不到 Claude 会话目录：$Root" }
+            $cutoff = (Get-Date).AddDays(-3)
+            $older = New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'
+            $byId = @{}
+            # Claude stores logs by project, so prioritize by modification time.
+            Get-ChildItem -LiteralPath $Root -Recurse -Filter '*.jsonl' -File -ErrorAction SilentlyContinue | ForEach-Object {
+                if ($Control.Cancelled) { throw [System.OperationCanceledException]::new() }
+                if ($_.FullName.Substring($Root.Length) -match '(?:^|[\\/])subagents[\\/]') { return }
+                if ($_.LastWriteTime -lt $cutoff) {
+                    $older.Add($_)
+                    return
+                }
+                $session = Get-ClaudeSessionFile $_
+                if ($null -ne $session -and (-not $byId.ContainsKey($session.Id) -or $session.LastSeen -gt $byId[$session.Id].LastSeen)) {
+                    $byId[$session.Id] = $session
+                }
+            }
+            $order = @{Expression='LastSeen'; Descending=$true}
+            $Queue.Enqueue([pscustomobject]@{ Kind='recent'; Sessions=@($byId.Values | Sort-Object $order, Id) })
+            foreach ($file in ($older | Sort-Object LastWriteTime -Descending)) {
+                if ($Control.Cancelled) { throw [System.OperationCanceledException]::new() }
+                if ($byId.ContainsKey($file.BaseName)) { continue }
+                $session = Get-ClaudeSessionFile $file
+                if ($null -ne $session) { $byId[$session.Id] = $session }
+            }
+            $Queue.Enqueue([pscustomobject]@{ Kind='complete'; Sessions=@($byId.Values | Sort-Object $order, Id) })
+        } catch [System.OperationCanceledException] {
+            # Closing the picker cancels further work.
+        } catch {
+            $Queue.Enqueue([pscustomobject]@{ Kind='error'; Message=$_.Exception.Message })
         }
     }
-    Start-Process wt -ArgumentList $wtArgs | Out-Null
-    Start-Sleep -Milliseconds 500
+    [void]$worker.AddScript($body.ToString()).AddArgument($PSCommandPath).AddArgument($ProjectsRoot).AddArgument($Queue).AddArgument($Control)
+    $handle = $worker.BeginInvoke()
+    [pscustomobject]@{ PowerShell=$worker; Handle=$handle }
+}
+
+function Get-ClaudeRunningIds {
+    $ids = @{}
+    try {
+        Get-CimInstance Win32_Process -Filter "Name = 'claude.exe' OR Name = 'node.exe'" -ErrorAction Stop | ForEach-Object {
+            if ($_.Name -eq 'node.exe' -and $_.CommandLine -notmatch '@anthropic-ai[\\/]claude-code[\\/]') { return }
+            if ($_.CommandLine -match '(?:^|\s)--resume(?:\s+|=)["'']?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?=$|[\s"''])') {
+                $ids[$matches[1]] = $true
+            }
+        }
+    } catch { }
+    return $ids
+}
+
+function Resolve-ClaudeCommand([bool]$UseCustom, [string]$Value) {
+    $extensions = @('.exe', '.com', '.cmd', '.bat', '.ps1')
+    if ($UseCustom) {
+        $value = $Value.Trim().Trim('"')
+        if (-not $value) { throw '请输入替代命令名或程序路径，例如 claude-work.cmd。' }
+        if ($value -match '[\\/]') {
+            $file = Get-Item -LiteralPath $value -ErrorAction SilentlyContinue
+            if ($file -is [IO.FileInfo] -and $file.Extension -in $extensions) { return $file.FullName }
+        } else {
+            $found = Get-Command -Name $value -CommandType Application,ExternalScript -ErrorAction SilentlyContinue |
+                Where-Object {
+                    [IO.Path]::GetExtension($_.Name) -in $extensions -and
+                    ($_.Name -eq $value -or [IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $value)
+                } | Select-Object -First 1
+            if ($found) { return $found.Source }
+        }
+        throw "找不到替代命令：$value。请输入 PATH 中的命令名或 .exe、.com、.cmd、.bat、.ps1 路径。"
+    }
+
+    $npmCommand = Join-Path $env:APPDATA 'npm\claude.cmd'
+    if (Test-Path -LiteralPath $npmCommand -PathType Leaf) { return $npmCommand }
+    $found = Get-Command -Name claude.exe,claude.cmd,claude.ps1,claude.bat -CommandType Application,ExternalScript -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($found) { return $found.Source }
+    throw '找不到 claude。请安装 Claude Code，或勾选“用其他命令代替 claude”并输入启动命令。'
+}
+
+function New-ClaudeTabCommand($Session, [string]$Command, [switch]$Cli, [switch]$BypassPermissions) {
+    $script = New-ResumeTabPrelude $Session.Cwd
+    if (-not $Cli) {
+        $script += '& ' + (ConvertTo-ResumeLiteral $Command) + ' --resume ' + (ConvertTo-ResumeLiteral $Session.Id)
+        if ($BypassPermissions) { $script += ' --dangerously-skip-permissions' }
+    }
+    [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script))
+}
+
+function Invoke-ClaudeResume {
+    $projectsRoot = $env:RESUME_PROJECTS_ROOT
+    if (-not $projectsRoot) { $projectsRoot = Join-Path $env:USERPROFILE '.claude\projects' }
+    $projectsRoot = [IO.Path]::GetFullPath($projectsRoot)
+    $chosen = @(Show-ResumeSessionPicker -Provider 'Claude Code' -TerminalHost $TerminalHost -Sessions @() -RunningIds (Get-ClaudeRunningIds) -StartScan {
+        param($queue, $control)
+        Start-ClaudeSessionScan -ProjectsRoot $projectsRoot -Queue $queue -Control $control
+    } -InitialCommand $ClaudeCommand -ResolveCommand {
+        param($useCustom, $value)
+        Resolve-ClaudeCommand -UseCustom $useCustom -Value $value
+    })
+    if ($chosen.Count -eq 0) { return }
+
+    $bypass = $env:RESUME_SKIP_PERMISSIONS -ne '0'
+    Start-ResumeSessionWindows -Chosen $chosen -TerminalHost $TerminalHost -NewTabCommand {
+        param($item, $cli)
+        New-ClaudeTabCommand -Session $item.Session -Command $item.Command -Cli:$cli -BypassPermissions:$bypass
+    } -StartWezTerm { param($groups) Start-ResumeWezTerm -Groups $groups -Provider 'Claude' }
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    try { Invoke-ClaudeResume }
+    catch { Write-Error $_ -ErrorAction Continue; exit 1 }
 }
