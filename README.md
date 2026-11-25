@@ -60,7 +60,7 @@ sudo apt install python3-tk
 
 ### Windows
 
-Claude Code：首次可运行 `配置运行环境.bat -TerminalOnly` 准备 WezTerm，然后双击 `还原Claude会话.bat`。也可以运行：
+Claude Code：首次可运行 `配置运行环境.bat -TerminalOnly` 准备 WezTerm，然后双击 `还原Claude会话.bat`。双击时会先询问打开方式：`1` 用 WezTerm（默认，5 秒内不选即用它），`2` 用 Windows Terminal（标签里跑 PowerShell，同样按分组把同组会话放进一个窗口；未安装 Windows Terminal 时退回独立 PowerShell 窗口）；带参数运行时不再询问，参数原样透传。也可以运行：
 
 ```powershell
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\resume-claude-sessions.ps1
@@ -77,6 +77,8 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\resume-codex-sessions
 Windows 版共用 PowerShell/WinForms 选择器和终端窗口逻辑，无需 Python。两者默认使用 WezTerm，同一正整数组号的会话在同一窗口内打开多个标签页，组号为 0 或留空时单独开窗。`+CLI` 在工作目录中额外打开一个命令行标签。已识别为打开的会话默认不勾选。Codex 恢复时加 `--no-daemon`，可用 `RESUME_PROXY` 显式指定代理。Codex 未配置代理时会探测本机 7890，端口不可用则保持直连。
 
 Windows 选择窗口会先显示，优先读取近 3 天活动的会话，再在后台加载历史会话。加载期间可以操作和打开已显示的会话，界面底部会显示扫描进度。Codex 较早创建、最近才重新使用的会话会在扫描其所在目录后补充显示。Codex 的 `-List` 和 `-AutoSelect` 会先扫描全部会话。
+
+列表按日期分组，组内按最后活动时间倒序排列，最近活跃的在最上面。Claude 的「最后活动」取自会话文件里最后一条带 `timestamp` 的记录，而不是文件修改时间：Claude 会在文件末尾追加 `cost-state` 之类没有时间戳的记录，而且经常同时刷新多个会话的文件，只看修改时间会把排序带偏。
 
 每个 WezTerm 窗口单独启动一个 GUI 进程，窗口内的同组标签页仍然放在一起。Windows 默认会让同一 GUI 线程的多个窗口共享输入法上下文，分开进程可避免左右并排窗口相互覆盖候选框位置。旧启动器已经打开的窗口需保存工作后关闭，再双击对应的恢复入口。手动把标签页移到新窗口仍可能共用原进程。[Windows 输入法上下文文档](https://learn.microsoft.com/en-us/windows/win32/intl/input-context)
 
@@ -95,7 +97,7 @@ WezTerm 是首次下载的外部依赖：仓库只保存安装脚本和配置，
 
 离线导入的 ZIP 必须匹配 [配置清单](config/wezterm.json) 中已验证版本的 SHA-256；也可以从可联网的机器复制整个共享缓存，再用 `RESUME_WEZTERM_HOME` 指向该目录。WezTerm 已准备好后，打开终端和恢复本地会话入口本身无需再次下载；Codex 请求仍使用其自身已配置的服务。环境配置入口检查 Codex CLI 是否存在，不自动安装 CLI 或替用户登录账户。
 
-两个 Windows 恢复入口都接受 `-TerminalHost wt` 或 `-TerminalHost conhost`。[Windows Terminal 输入法问题报告](https://github.com/microsoft/terminal/issues/20481)
+两个 Windows 恢复入口都接受 `-TerminalHost wezterm`、`-TerminalHost wt` 或 `-TerminalHost conhost`；`还原Claude会话.bat` 双击时选 `2` 等价于 `-TerminalHost wt`（找不到 Windows Terminal 时退回 `conhost`）。[Windows Terminal 输入法问题报告](https://github.com/microsoft/terminal/issues/20481)
 
 ### Comate / VSCode 远程（追加到当前窗口）
 

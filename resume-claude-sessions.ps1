@@ -9,6 +9,34 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'scripts\wezterm.ps1')
 . (Join-Path $PSScriptRoot 'scripts\session-picker.ps1')
 
+function Get-ClaudeTranscriptActivity([System.IO.FileInfo]$File) {
+    # Claude appends records without a timestamp (cost-state and similar bookkeeping) at the end
+    # of a transcript, often for several sessions at once, so the file's LastWriteTime drifts
+    # away from real activity. Sort and display by the last record that does carry a timestamp.
+    $stream = $null
+    try {
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.File]::Open($File.FullName, 'Open', 'Read', $share)
+        $size = $stream.Length
+        if ($size -le 0) { return }
+        $take = [Math]::Min($size, 65536)
+        $stream.Seek($size - $take, 'Begin') | Out-Null
+        $buffer = New-Object byte[] $take
+        $read = $stream.Read($buffer, 0, $take)
+        $lines = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read).Split("`n")
+        for ($index = $lines.Count - 1; $index -ge 0; $index--) {
+            if ($lines[$index] -match '"timestamp":"([^"]+)"') {
+                $parsed = [DateTimeOffset]::Parse($matches[1], [Globalization.CultureInfo]::InvariantCulture)
+                return $parsed.LocalDateTime
+            }
+        }
+    } catch {
+        # Unreadable tails fall back to the file timestamp.
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
 function Get-ClaudeSessionFile([System.IO.FileInfo]$File) {
     $reader = $null
     $stream = $null
@@ -25,8 +53,9 @@ function Get-ClaudeSessionFile([System.IO.FileInfo]$File) {
             if ($cwd -isnot [string] -or -not $cwd) { continue }
             if (-not (Test-Path -LiteralPath $cwd -PathType Container)) { return }
             $name = Split-Path -Path $cwd -Leaf
+            $activity = Get-ClaudeTranscriptActivity $File
             return [pscustomobject]@{
-                Id=$File.BaseName; Cwd=$cwd; Name=$(if ($name) { $name } else { $cwd }); LastSeen=$File.LastWriteTime
+                Id=$File.BaseName; Cwd=$cwd; Name=$(if ($name) { $name } else { $cwd }); LastSeen=$(if ($null -ne $activity) { $activity } else { $File.LastWriteTime })
             }
         }
     } catch {
